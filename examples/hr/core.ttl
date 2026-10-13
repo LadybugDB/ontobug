@@ -1,0 +1,27 @@
+@prefix core: <https://example.org/core#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# A small upper ontology: agents, people, organizations.
+<https://example.org/core#> a owl:Ontology ;
+    rdfs:label "Core ontology" ;
+    owl:versionInfo "1.0.0" .
+
+core:Agent a owl:Class ;
+    rdfs:label "Agent" .
+
+core:Person a owl:Class ;
+    rdfs:subClassOf core:Agent ;
+    rdfs:label "Person" .
+
+core:Organization a owl:Class ;
+    rdfs:subClassOf core:Agent ;
+    rdfs:label "Organization" .
+
+core:Person owl:disjointWith core:Organization .
+
+core:name a owl:DatatypeProperty ;
+    rdfs:domain core:Agent ;
+    rdfs:range xsd:string ;
+    rdfs:label "name" .

@@ -1,0 +1,21 @@
+@prefix ex:   <https://example.org/people/> .
+@prefix hr:   <https://example.org/hr#> .
+@prefix core: <https://example.org/core#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+ex:acme a core:Organization ;
+    core:name "ACME Corp" .
+
+ex:alice a hr:Manager ;
+    core:name "Alice Liddell" ;
+    hr:email "alice@acme.example" ;
+    hr:worksFor ex:acme ;
+    hr:salary 120000.00 ;
+    hr:hireDate "2019-04-01"^^xsd:date ;
+    hr:manages ex:bob .
+
+ex:bob a hr:Employee ;
+    core:name "Bob Builder" ;
+    hr:email "bob@acme.example" ;
+    hr:worksFor ex:acme ;
+    hr:salary 85000.00 .

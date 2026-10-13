@@ -1,0 +1,15 @@
+PREFIX core: <https://example.org/core#>
+PREFIX hr:   <https://example.org/hr#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+PREFIX :     <https://example.org/hr/shex#>
+
+:Employee {
+  core:name   xsd:string ;
+  hr:email    xsd:string * ;
+  hr:worksFor @:Organization ;
+  hr:salary   xsd:decimal ?
+}
+
+:Organization {
+  core:name xsd:string
+}

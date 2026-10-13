@@ -1,0 +1,54 @@
+@prefix hr:   <https://example.org/hr#> .
+@prefix core: <https://example.org/core#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# The HR ontology. It imports the core ontology by its ontology IRI.
+<https://example.org/hr#> a owl:Ontology ;
+    rdfs:label "HR ontology" ;
+    owl:versionIRI <https://example.org/hr/2.1.0> ;
+    owl:versionInfo "2.1.0" ;
+    owl:imports <https://example.org/core#> .
+
+hr:Employee a owl:Class ;
+    rdfs:subClassOf core:Person ;
+    rdfs:label "Employee" .
+
+hr:Manager a owl:Class ;
+    rdfs:subClassOf hr:Employee ;
+    rdfs:label "Manager" .
+
+hr:Contractor a owl:Class ;
+    rdfs:subClassOf core:Person ;
+    owl:disjointWith hr:Employee ;
+    rdfs:label "Contractor" .
+
+hr:worksFor a owl:ObjectProperty , owl:FunctionalProperty ;
+    rdfs:domain hr:Employee ;
+    rdfs:range core:Organization ;
+    rdfs:label "works for" .
+
+hr:manages a owl:ObjectProperty ;
+    rdfs:domain hr:Manager ;
+    rdfs:range hr:Employee ;
+    owl:inverseOf hr:managedBy ;
+    rdfs:label "manages" .
+
+hr:managedBy a owl:ObjectProperty ;
+    rdfs:label "managed by" .
+
+hr:email a owl:DatatypeProperty ;
+    rdfs:domain core:Person ;
+    rdfs:range xsd:string ;
+    rdfs:label "email" .
+
+hr:salary a owl:DatatypeProperty , owl:FunctionalProperty ;
+    rdfs:domain hr:Employee ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "salary" .
+
+hr:hireDate a owl:DatatypeProperty , owl:FunctionalProperty ;
+    rdfs:domain hr:Employee ;
+    rdfs:range xsd:date ;
+    rdfs:label "hire date" .

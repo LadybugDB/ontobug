@@ -1,0 +1,55 @@
+@prefix hrsh: <https://example.org/hr/shapes#> .
+@prefix hr:   <https://example.org/hr#> .
+@prefix core: <https://example.org/core#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# Every person has exactly one name and well-formed e-mail addresses.
+hrsh:PersonShape a sh:NodeShape ;
+    sh:targetClass core:Person ;
+    sh:property [
+        sh:path core:name ;
+        sh:datatype xsd:string ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "A person has exactly one name (xsd:string)."
+    ] ;
+    sh:property [
+        sh:path hr:email ;
+        sh:datatype xsd:string ;
+        sh:pattern "^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$" ;
+        sh:message "E-mail addresses look like name@domain.tld."
+    ] .
+
+# Every employee works for exactly one organization and has a non-negative salary.
+hrsh:EmployeeShape a sh:NodeShape ;
+    sh:targetClass hr:Employee ;
+    sh:property [
+        sh:path hr:worksFor ;
+        sh:class core:Organization ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "An employee works for exactly one organization."
+    ] ;
+    sh:property [
+        sh:path hr:salary ;
+        sh:datatype xsd:decimal ;
+        sh:maxCount 1 ;
+        sh:minInclusive 0 ;
+        sh:message "Salary is one non-negative xsd:decimal."
+    ] ;
+    sh:property [
+        sh:path hr:hireDate ;
+        sh:datatype xsd:date ;
+        sh:maxCount 1
+    ] .
+
+# A manager manages at least one employee.
+hrsh:ManagerShape a sh:NodeShape ;
+    sh:targetClass hr:Manager ;
+    sh:property [
+        sh:path hr:manages ;
+        sh:class hr:Employee ;
+        sh:minCount 1 ;
+        sh:message "A manager manages at least one employee."
+    ] .

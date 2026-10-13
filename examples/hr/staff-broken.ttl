@@ -1,0 +1,19 @@
+@prefix ex:   <https://example.org/people/> .
+@prefix hr:   <https://example.org/hr#> .
+@prefix core: <https://example.org/core#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+ex:acme a core:Organization ;
+    core:name "ACME Corp" .
+
+# A manager with no explicit hr:Employee type: the ontology makes it one.
+ex:carol a hr:Manager ;
+    core:name "Carol" ;
+    hr:email "carol(at)acme" ;
+    hr:salary -10 .
+
+ex:dave a hr:Employee ;
+    hr:worksFor ex:acme , ex:globex ;
+    hr:salary "a lot" .
+
+ex:globex core:name "Globex" .

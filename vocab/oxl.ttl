@@ -1,0 +1,191 @@
+@prefix oxl:     <https://oxilite.dev/ns#> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix sh:      <http://www.w3.org/ns/shacl#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix vann:    <http://purl.org/vocab/vann/> .
+@prefix prov:    <http://www.w3.org/ns/prov#> .
+@prefix sd:      <http://www.w3.org/ns/sparql-service-description#> .
+@prefix spdx:    <http://spdx.org/rdf/terms#> .
+
+# The oxilite vocabulary: the schema registry kept in the system graph <oxilite:schema>, the SHACL
+# shapes the registry conforms to, and the terms of the history graph <oxilite:history>.
+# Everything here is plain RDF: a store without oxilite (Oxigraph, any SPARQL 1.1 store) can
+# hold, query, update and validate it.
+
+<https://oxilite.dev/ns#> a owl:Ontology ;
+    dcterms:title "oxilite vocabulary"@en ;
+    rdfs:label "oxilite vocabulary" ;
+    owl:versionInfo "2.1" ;
+    owl:versionIRI <https://oxilite.dev/ns/2.1> ;
+    owl:priorVersion <https://oxilite.dev/ns/2> ;
+    owl:backwardCompatibleWith <https://oxilite.dev/ns/2> ;
+    dcterms:creator "Volodymyr Pavlyshyn" ;
+    dcterms:license <https://opensource.org/licenses/MIT> , <https://www.apache.org/licenses/LICENSE-2.0> ;
+    vann:preferredNamespacePrefix "oxl" ;
+    vann:preferredNamespaceUri "https://oxilite.dev/ns#" ;
+    rdfs:seeAlso <https://oxilitedb.com/ns/> ;
+    rdfs:comment "Terms oxilite uses in its system graphs: <oxilite:schema> (which named graphs hold ontologies, SHACL shapes or ShEx schemas, and which graphs they apply to) and <oxilite:history>. Version 2: oxl:SystemGraph is no longer a schema graph, oxl:GraphTarget types the targets of oxl:appliesTo, and the registry shapes are included. Version 2.1: oxl:RegisteredGraph is the domain of the registration properties (so the system graphs' descriptions are consistent under OWL), the registry records imports with oxl:imports (owl:imports there is still read), oxl:textMatch is an sd:Function and the history terms have a domain." .
+
+# ------------------------------------------------------------------------------ schema registry
+
+oxl:RegisteredGraph a owl:Class ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:subClassOf sd:Graph ;
+    owl:disjointUnionOf ( oxl:SchemaGraph oxl:SystemGraph ) ;
+    rdfs:label "registered graph" ;
+    rdfs:comment "A graph described in <oxilite:schema>: a schema graph or a system graph. The subject is the graph's IRI, read as denoting the graph itself (an sd:Graph), not the name-graph pair of sd:NamedGraph. The domain of the registration properties." .
+
+oxl:SchemaGraph a owl:Class ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:subClassOf oxl:RegisteredGraph ;
+    rdfs:label "schema graph" ;
+    rdfs:comment "A named graph holding schema rather than data. Described in <oxilite:schema> with the graph's own IRI as subject; the default graph is oxl:DefaultGraph. A graph may hold several roles (an ontology with its SHACL shapes): it is then typed with each role class." .
+
+oxl:OntologyGraph a owl:Class ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:subClassOf oxl:SchemaGraph ;
+    rdfs:label "ontology graph" ;
+    rdfs:comment "An RDFS / OWL ontology. Its axioms drive query-time reasoning over the graphs it applies to, together with the axioms of the active ontologies it imports." .
+
+oxl:ShapesGraph a owl:Class ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:subClassOf oxl:SchemaGraph ;
+    rdfs:label "SHACL shapes graph" ;
+    rdfs:comment "SHACL shapes for validating the graphs it applies to. `?data sh:shapesGraph ?shapes` is derivable from `?shapes oxl:appliesTo ?data` (see the CONSTRUCT recipe in the registry reference)." ;
+    rdfs:seeAlso sh:shapesGraph .
+
+oxl:ShExGraph a owl:Class ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:subClassOf oxl:SchemaGraph ;
+    rdfs:label "ShEx schema graph" ;
+    rdfs:comment "A ShEx schema (in RDF) for validating the graphs it applies to." .
+
+oxl:SystemGraph a owl:Class ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:subClassOf oxl:RegisteredGraph ;
+    owl:disjointWith oxl:SchemaGraph ;
+    rdfs:label "system graph" ;
+    rdfs:comment "A graph oxilite maintains itself: <oxilite:schema> (the registry, which is data about graphs, not schema) and <oxilite:vocabulary> (this vocabulary). Hidden with the schema graphs. The set is fixed: typing another graph oxl:SystemGraph hides it but never takes it out of reasoning or the shape index." .
+
+oxl:GraphTarget a owl:Class ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:label "graph target" ;
+    rdfs:comment "What oxl:appliesTo points at: a named graph (by its IRI), oxl:DefaultGraph, or the selector oxl:AllGraphs." .
+
+oxl:appliesTo a owl:ObjectProperty ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain oxl:RegisteredGraph ;
+    rdfs:range oxl:GraphTarget ;
+    rdfs:label "applies to" ;
+    rdfs:comment "A graph the schema describes: a graph IRI, oxl:DefaultGraph, or oxl:AllGraphs. oxilite always writes at least one value (oxl:AllGraphs for every graph); a registration without any is read as applying to every graph." ;
+    rdfs:seeAlso sh:shapesGraph .
+
+oxl:active a owl:DatatypeProperty , owl:FunctionalProperty ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain oxl:RegisteredGraph ;
+    rdfs:range xsd:boolean ;
+    rdfs:label "active" ;
+    rdfs:comment "An xsd:boolean false (\"false\" or \"0\") keeps the graph registered (and hidden as schema) but stops it contributing. oxilite always writes it; absent means true. Any other literal, a plain \"false\" included, is invalid and ignored." .
+
+oxl:ontologyIri a owl:ObjectProperty , owl:FunctionalProperty ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain oxl:RegisteredGraph ;
+    rdfs:range owl:Ontology ;
+    rdfs:label "ontology IRI" ;
+    rdfs:comment "The owl:Ontology IRI of the graph's content, when it differs from the graph name. owl:imports of other ontologies resolve against it as well as against graph names." .
+
+oxl:version a owl:DatatypeProperty , owl:FunctionalProperty ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain oxl:RegisteredGraph ;
+    rdfs:range xsd:string ;
+    rdfs:label "version" ;
+    rdfs:comment "A version pinned at registration: an owl:versionIRI, an owl:versionInfo, a tag, a release number. It describes the registration; the ontology's own owl:versionInfo / owl:versionIRI stay in its graph." ;
+    rdfs:seeAlso owl:versionInfo , owl:versionIRI .
+
+oxl:sha256 a owl:DatatypeProperty , owl:FunctionalProperty ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain oxl:RegisteredGraph ;
+    rdfs:range xsd:string ;
+    rdfs:label "SHA-256" ;
+    rdfs:comment "Lowercase hex SHA-256 of the document the graph was loaded from, for drift detection (`oxilite registry verify`)." ;
+    rdfs:seeAlso spdx:checksum .
+
+oxl:loadedAt a owl:DatatypeProperty , owl:FunctionalProperty ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:subPropertyOf dcterms:date ;
+    rdfs:domain oxl:RegisteredGraph ;
+    rdfs:range xsd:dateTime ;
+    rdfs:label "loaded at" ;
+    rdfs:comment "When the graph was registered." ;
+    rdfs:seeAlso prov:generatedAtTime .
+
+oxl:imports a owl:ObjectProperty ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain oxl:RegisteredGraph ;
+    rdfs:label "imports" ;
+    rdfs:comment "An ontology the registered graph's content imports, recorded in the registry. It resolves like an owl:imports asserted in the ontology's own graph: against the graph names and oxl:ontologyIri of the active registered ontologies. Not owl:imports, whose domain (owl:Ontology) would make every registration an ontology and make OWL tools loading the registry fetch the imports. An owl:imports in the registry (vocabulary 2) is still read." ;
+    rdfs:seeAlso owl:imports .
+
+oxl:DefaultGraph a owl:NamedIndividual , oxl:GraphTarget ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:label "default graph" ;
+    rdfs:comment "Names the default graph where an IRI is needed: as a registered schema graph, or as a target of oxl:appliesTo." .
+
+oxl:AllGraphs a owl:NamedIndividual , oxl:GraphTarget ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:label "all graphs" ;
+    rdfs:comment "As a target of oxl:appliesTo: every graph of the dataset. A selector, not a graph; it never names a registered graph." .
+
+# ------------------------------------------------------------------------------ registry shapes
+#
+# What a registry in <oxilite:schema> must look like. Validate it with any SHACL processor
+# (this file as the shapes graph, <oxilite:schema> as the data graph), or with
+# `oxilite registry check`, which checks the same constraints without a SHACL engine. SHACL
+# class targets do not follow rdfs:subClassOf in the shapes graph, so each role class is a
+# target of its own.
+
+oxl:RegistrationShape a sh:NodeShape ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:label "registration shape" ;
+    sh:targetClass oxl:OntologyGraph , oxl:ShapesGraph , oxl:ShExGraph , oxl:SystemGraph ;
+    sh:targetSubjectsOf oxl:appliesTo , oxl:active , oxl:ontologyIri , oxl:version , oxl:sha256 , oxl:loadedAt , oxl:imports ;
+    sh:nodeKind sh:IRI ;
+    sh:property [
+        sh:path rdf:type ;
+        sh:qualifiedValueShape [ sh:in ( oxl:OntologyGraph oxl:ShapesGraph oxl:ShExGraph oxl:SystemGraph ) ] ;
+        sh:qualifiedMinCount 1 ;
+        sh:message "A registration needs a role class: oxl:OntologyGraph, oxl:ShapesGraph or oxl:ShExGraph."
+    ] ;
+    sh:property [ sh:path oxl:active ; sh:maxCount 1 ; sh:datatype xsd:boolean ] ;
+    sh:property [ sh:path oxl:appliesTo ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path oxl:ontologyIri ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path oxl:version ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+    sh:property [ sh:path oxl:sha256 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^[0-9a-f]{64}$" ] ;
+    sh:property [ sh:path oxl:loadedAt ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ;
+    sh:property [ sh:path oxl:imports ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path owl:imports ; sh:nodeKind sh:IRI ] .
+
+# ------------------------------------------------------------------------------ history graph
+#
+# A commit of <oxilite:history> is a prov:Activity with prov:startedAtTime, prov:wasAssociatedWith,
+# rdfs:comment and prov:wasInformedBy (the commit before it).
+
+oxl:added a rdf:Property ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain prov:Activity ;
+    rdfs:label "added" ;
+    rdfs:comment "In <oxilite:history>: a triple (as a triple term) the commit added." .
+
+oxl:removed a rdf:Property ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:domain prov:Activity ;
+    rdfs:label "removed" ;
+    rdfs:comment "In <oxilite:history>: a triple (as a triple term) the commit removed." .
+
+oxl:textMatch a sd:Function ;
+    rdfs:isDefinedBy <https://oxilite.dev/ns#> ;
+    rdfs:label "text match" ;
+    rdfs:comment "A SPARQL function: oxl:textMatch(?literal, \"query\") is true when the literal matches the full-text query." .

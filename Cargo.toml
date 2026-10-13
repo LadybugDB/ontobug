@@ -1,0 +1,35 @@
+[package]
+name = "ontolith"
+description = "Vocabulary and ontology management for RDF datasets: register OWL ontologies, SHACL shapes and ShEx schemas as named graphs, map them to data graphs, and validate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Volodymyr Pavlyshyn"]
+keywords = ["rdf", "owl", "shacl", "ontology", "validation"]
+categories = ["database", "command-line-utilities"]
+rust-version = "1.85"
+readme = "README.md"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:serde_json"]
+
+[dependencies]
+oxigraph = { version = "0.5.11", default-features = false }
+oxrdf = "0.3.4"
+oxrdfio = "0.2.6"
+oxsdatatypes = "0.2.3"
+spargebra = "0.4.7"
+sha2 = "0.10"
+thiserror = "2"
+rudof_rdf = "0.3.21"
+rudof_iri = "0.3.21"
+shacl = "0.3.21"
+shex_ast = "0.3.21"
+shex_validation = "0.3.21"
+clap = { version = "4", features = ["derive", "env"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[[bin]]
+name = "ontolith"
+required-features = ["cli"]
