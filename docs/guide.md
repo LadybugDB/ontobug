@@ -161,6 +161,23 @@ deletes the class nodes its shapes pointed at.
 So the class hierarchy and the shape-to-property paths are queryable (see [§12](#12-cypher-recipes)).
 Unregistering keeps a graph's projection with its triples; `remove --drop` deletes both.
 
+Namespaces partition the projection the way they partition RDF: every content node
+carries its `namespace` (the term IRI up to its last `#` or `/`), and `Namespace` nodes
+inventory each one with its prefix, term count and source graphs:
+
+```sh
+$ ontobug namespaces
+core       https://example.org/core#                         5 terms  https://example.org/onto/core https://example.org/shapes/hr
+hr         https://example.org/hr#                          14 terms  https://example.org/onto/hr https://example.org/shapes/hr
+hrsh       https://example.org/hr/shapes#                    3 terms  https://example.org/shapes/hr
+```
+
+Prefixes come from the documents' `@prefix` declarations when present
+(`@prefix core:` above; the shapes' own `@prefix hrsh:` similarly wins over a derived
+name), and are derived from the IRI otherwise. Query a namespace as a subgraph
+([§12](#12-cypher-recipes)). Databases written before namespaces existed are migrated
+automatically on open.
+
 ## 4. Adding an OWL ontology
 
 ### 4.1 Write the ontology
@@ -716,6 +733,18 @@ Stubs: classes referenced but defined nowhere (external imports worth registerin
 MATCH (c:OntologyClass) WHERE c.label = '' RETURN c.graph, c.iri;
 ```
 
+Namespaces: terms of one vocabulary — the subgraph view:
+
+```cypher
+MATCH (c:OntologyClass) WHERE c.namespace = 'http://schema.org/' RETURN count(c);
+```
+
+Namespace inventory, same as `ontobug namespaces`:
+
+```cypher
+MATCH (n:Namespace) RETURN n.prefix, n.iri, n.termCount ORDER BY n.prefix;
+```
+
 ## 13. Using another SHACL processor
 
 The dataset is standard RDF, so any SHACL processor can validate it. Export the graphs that `ontobug scope` names:
@@ -799,6 +828,7 @@ Projected content, rebuilt by `add` and `ontobug project`:
 | `HAS_CONSTRAINT` | rel | Shape to its property constraints |
 | `TARGETS` | rel | Shape to the classes of its target classes, whatever graph defined them |
 | `ON_PROPERTY` | rel | Constraint to the property of its path |
+| `Namespace` | node | `iri`, `prefix`, `sourceGraphs` (JSON), `termCount`; one per namespace in the projected content |
 
 ## 16. Compatibility and limits
 

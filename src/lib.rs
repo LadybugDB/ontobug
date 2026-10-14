@@ -42,7 +42,7 @@ pub use catalog::{
     Drift, ValidateOptions, Validation,
 };
 pub use error::{Error, Result};
-pub use ladybug::{LadybugSchemaStore, Projected};
+pub use ladybug::{LadybugSchemaStore, NamespaceInfo, Projected};
 pub use registry::{SchemaGraph, SchemaRole};
 pub use validate::{Finding, Mode, Report, ShexResult};
 

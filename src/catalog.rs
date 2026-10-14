@@ -10,7 +10,7 @@
 //! store directly, without a query language.
 
 use crate::error::{Error, Result};
-use crate::ladybug::{LadybugSchemaStore, Projected};
+use crate::ladybug::{LadybugSchemaStore, NamespaceInfo, Projected};
 use crate::registry::{self, owl, rdfs, SchemaGraph, SchemaRole, RDF_TYPE};
 use crate::validate::{self, Mode, Report, ShexResult};
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
@@ -291,6 +291,12 @@ impl Catalog {
             e.version = e.version.or(version);
         }
         self.register(&e)?;
+        if format == RdfFormat::Turtle {
+            // Explicit `@prefix` declarations become the namespaces' prefixes.
+            for (prefix, iri) in harvest_turtle_prefixes(document) {
+                self.registry.set_prefix(&iri, &prefix)?;
+            }
+        }
         if matches!(role, SchemaRole::Ontology | SchemaRole::Shacl) {
             // The schema itself is stored in Ladybug as nodes and edges, not just
             // registered: re-projecting replaces the graph's previous projection.
@@ -392,6 +398,7 @@ impl Catalog {
             .clear_content_projection(&graph.into_owned())?;
         self.registry.remove_graph(&graph.into_owned())?;
         self.store.clear_graph(graph)?;
+        self.registry.refresh_namespaces()?;
         Ok(())
     }
 
@@ -470,7 +477,14 @@ impl Catalog {
             }
         }
         projected.links = self.registry.relink_shapes()?;
+        projected.namespaces = self.registry.refresh_namespaces()?;
         Ok(projected)
+    }
+
+    /// Every namespace in the projected content, ordered by prefix: the subgraphs of
+    /// the Ladybug database (see [`NamespaceInfo`]).
+    pub fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
+        self.registry.list_namespaces()
     }
 
     /// What is wrong with the registry: structural violations over the Ladybug entries.
@@ -716,4 +730,44 @@ pub fn parse_targets<S: AsRef<str>>(items: &[S]) -> Result<Vec<GraphName>> {
         return Ok(Vec::new());
     }
     items.iter().map(|s| parse_graph(s.as_ref())).collect()
+}
+
+/// The `@prefix name: <iri>` declarations of a Turtle document, for namespace prefixes.
+/// Hand-rolled line scan (the RDF parser does not expose prefixes); anything else
+/// falls back to derived prefixes.
+fn harvest_turtle_prefixes(document: &[u8]) -> Vec<(String, String)> {
+    let Ok(text) = std::str::from_utf8(document) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("@prefix") else {
+            continue;
+        };
+        let Some((name, rest)) = rest.trim_start().split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || !name.starts_with(|c: char| c.is_ascii_alphabetic())
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            continue;
+        }
+        let iri = rest
+            .trim_start()
+            .trim_end_matches('.')
+            .trim_end()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim();
+        if iri.is_empty() {
+            continue;
+        }
+        out.push((name.to_owned(), iri.to_owned()));
+    }
+    out
 }

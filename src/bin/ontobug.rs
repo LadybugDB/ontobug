@@ -91,6 +91,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Output::Text)]
         output: Output,
     },
+    /// List the namespaces in the projected content: prefix, IRI, terms, graphs.
+    Namespaces,
     /// The schemas that apply to a data graph (ontology imports resolved).
     Scope { graph: String },
     /// Set the data graphs a registration applies to.
@@ -162,6 +164,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// Prints TSV-style rows, exiting quietly when the reader goes away first (`| head`,
+/// `| grep -q`): Rust ignores SIGPIPE, so a closed stdout surfaces as EPIPE instead.
+fn print_rows(rows: &[Vec<String>]) -> ExitCode {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    for row in rows {
+        if let Err(e) = writeln!(out, "{}", row.join("\t")) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return ExitCode::SUCCESS;
+            }
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn graph_label(g: &GraphName) -> String {
     match g {
         GraphName::DefaultGraph => "DEFAULT".into(),
@@ -195,13 +214,13 @@ fn entry_json(e: &SchemaGraph) -> Value {
     })
 }
 
-fn print_entry(e: &SchemaGraph) {
+fn entry_line(e: &SchemaGraph) -> String {
     let targets = if e.applies_to.is_empty() {
         "ALL".to_owned()
     } else {
         labels(&e.applies_to)
     };
-    print!(
+    let mut s = format!(
         "{:<8} {:<8} {} -> {}",
         e.role.name(),
         if e.active { "active" } else { "inactive" },
@@ -209,15 +228,19 @@ fn print_entry(e: &SchemaGraph) {
         targets
     );
     if let Some(v) = &e.version {
-        print!("  version={v}");
+        s.push_str(&format!("  version={v}"));
     }
     if let Some(i) = &e.iri {
-        print!("  ontology={i}");
+        s.push_str(&format!("  ontology={i}"));
     }
     for i in &e.imports {
-        print!("  imports={i}");
+        s.push_str(&format!("  imports={i}"));
     }
-    println!();
+    s
+}
+
+fn print_entry(e: &SchemaGraph) {
+    println!("{}", entry_line(e));
 }
 
 fn validation_json(v: &Validation) -> Value {
@@ -294,20 +317,50 @@ fn run(cli: Cli) -> ontobug::Result<ExitCode> {
             let entries = c.list()?;
             if output == Output::Json {
                 let all: Vec<Value> = entries.iter().map(entry_json).collect();
-                println!("{}", serde_json::to_string_pretty(&all).expect("json"));
+                return Ok(print_rows(&[vec![
+                    serde_json::to_string_pretty(&all).expect("json")
+                ]]));
             } else if entries.is_empty() {
                 println!("nothing registered");
             } else {
-                entries.iter().for_each(print_entry);
+                return Ok(print_rows(
+                    &entries
+                        .iter()
+                        .map(entry_line)
+                        .map(|l| vec![l])
+                        .collect::<Vec<_>>(),
+                ));
             }
+        }
+        Command::Namespaces => {
+            return Ok(print_rows(
+                &c.namespaces()?
+                    .iter()
+                    .map(|n| {
+                        vec![format!(
+                            "{:<10} {:<45} {:>5} terms  {}",
+                            n.prefix,
+                            n.iri,
+                            n.terms,
+                            n.graphs.join(" ")
+                        )]
+                    })
+                    .collect::<Vec<_>>(),
+            ));
         }
         Command::Scope { graph } => {
             let g = parse_graph(&graph)?;
+            let mut rows = Vec::new();
             for role in SchemaRole::ALL {
                 for e in c.schemas_for(g.as_ref(), role)? {
-                    println!("{:<8} {}", role.name(), graph_label(&e.graph));
+                    rows.push(vec![format!(
+                        "{:<8} {}",
+                        role.name(),
+                        graph_label(&e.graph)
+                    )]);
                 }
             }
+            return Ok(print_rows(&rows));
         }
         Command::Map { graph, to } => {
             let g = parse_graph(&graph)?;
@@ -415,11 +468,7 @@ fn run(cli: Cli) -> ontobug::Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         }
-        Command::Cypher { cypher } => {
-            for row in c.cypher(&cypher)? {
-                println!("{}", row.join("\t"));
-            }
-        }
+        Command::Cypher { cypher } => return Ok(print_rows(&c.cypher(&cypher)?)),
         Command::Project { graph } => {
             let g = parse_graph(&graph)?;
             let p = c.project_graph_content(g.as_ref())?;

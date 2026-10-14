@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::registry::{SchemaGraph, SchemaRole, RDF_TYPE};
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 use oxrdf::{GraphName, NamedNode};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -54,21 +55,21 @@ const CREATE_TABLE: &str = "CREATE NODE TABLE SchemaEntry(\
 
 /// Node and relationship tables for projected schema content: the schemas themselves as
 /// a property graph (see [`LadybugSchemaStore::project_ontology`]).
-const CONTENT_TABLES: [&str; 11] = [
+const CONTENT_TABLES: [&str; 12] = [
     "CREATE NODE TABLE OntologyClass(\
-        id STRING PRIMARY KEY, iri STRING, label STRING, comment STRING, graph STRING)",
+        id STRING PRIMARY KEY, iri STRING, label STRING, comment STRING, namespace STRING, graph STRING)",
     "CREATE NODE TABLE OntologyProperty(\
         id STRING PRIMARY KEY, iri STRING, kind STRING, label STRING, comment STRING, \
-        rangeDatatypes STRING, graph STRING)",
+        rangeDatatypes STRING, namespace STRING, graph STRING)",
     "CREATE NODE TABLE ShaclShape(\
         id STRING PRIMARY KEY, shape STRING, targetClasses STRING, targetNodes STRING, \
         targetSubjectsOf STRING, targetObjectsOf STRING, message STRING, severity STRING, \
-        deactivated BOOLEAN, graph STRING)",
+        deactivated BOOLEAN, namespace STRING, graph STRING)",
     "CREATE NODE TABLE ShaclProperty(\
         id STRING PRIMARY KEY, shapeId STRING, path STRING, datatype STRING, class STRING, \
         nodeKind STRING, minCount INT64, maxCount INT64, pattern STRING, \
         minInclusive STRING, maxInclusive STRING, message STRING, severity STRING, \
-        deactivated BOOLEAN, graph STRING)",
+        deactivated BOOLEAN, namespace STRING, graph STRING)",
     "CREATE REL TABLE SUBCLASS_OF(FROM OntologyClass TO OntologyClass)",
     "CREATE REL TABLE EQUIVALENT_CLASS(FROM OntologyClass TO OntologyClass)",
     "CREATE REL TABLE DOMAIN(FROM OntologyProperty TO OntologyClass)",
@@ -76,7 +77,91 @@ const CONTENT_TABLES: [&str; 11] = [
     "CREATE REL TABLE HAS_CONSTRAINT(FROM ShaclShape TO ShaclProperty)",
     "CREATE REL TABLE TARGETS(FROM ShaclShape TO OntologyClass)",
     "CREATE REL TABLE ON_PROPERTY(FROM ShaclProperty TO OntologyProperty)",
+    "CREATE NODE TABLE Namespace(\
+        iri STRING PRIMARY KEY, prefix STRING, sourceGraphs STRING, termCount INT64)",
 ];
+
+/// Content relationship tables with their endpoint node tables.
+const CONTENT_RELS: [(&str, &str, &str); 7] = [
+    ("SUBCLASS_OF", "OntologyClass", "OntologyClass"),
+    ("EQUIVALENT_CLASS", "OntologyClass", "OntologyClass"),
+    ("DOMAIN", "OntologyProperty", "OntologyClass"),
+    ("RANGE", "OntologyProperty", "OntologyClass"),
+    ("HAS_CONSTRAINT", "ShaclShape", "ShaclProperty"),
+    ("TARGETS", "ShaclShape", "OntologyClass"),
+    ("ON_PROPERTY", "ShaclProperty", "OntologyProperty"),
+];
+
+/// Content node tables with the columns they had before the `namespace` column existed.
+const LEGACY_NODE_COLS: [(&str, &[&str]); 4] = [
+    ("OntologyClass", &["id", "iri", "label", "comment", "graph"]),
+    (
+        "OntologyProperty",
+        &[
+            "id",
+            "iri",
+            "kind",
+            "label",
+            "comment",
+            "rangeDatatypes",
+            "graph",
+        ],
+    ),
+    (
+        "ShaclShape",
+        &[
+            "id",
+            "shape",
+            "targetClasses",
+            "targetNodes",
+            "targetSubjectsOf",
+            "targetObjectsOf",
+            "message",
+            "severity",
+            "deactivated",
+            "graph",
+        ],
+    ),
+    (
+        "ShaclProperty",
+        &[
+            "id",
+            "shapeId",
+            "path",
+            "datatype",
+            "class",
+            "nodeKind",
+            "minCount",
+            "maxCount",
+            "pattern",
+            "minInclusive",
+            "maxInclusive",
+            "message",
+            "severity",
+            "deactivated",
+            "graph",
+        ],
+    ),
+];
+
+fn is_int_col(col: &str) -> bool {
+    matches!(col, "minCount" | "maxCount" | "termCount")
+}
+
+fn is_bool_col(col: &str) -> bool {
+    matches!(col, "deactivated" | "active")
+}
+
+/// A display-string cell back into a value: empty counts become NULL, booleans parse.
+fn cell_value(col: &str, cell: &str) -> Value {
+    if is_int_col(col) {
+        return opt_int(cell.parse().ok());
+    }
+    if is_bool_col(col) {
+        return Value::Bool(cell == "True" || cell == "true" || cell == "1");
+    }
+    Value::String(cell.to_owned())
+}
 
 // RDF predicates read while projecting schema content.
 const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
@@ -100,6 +185,81 @@ fn sh(local: &str) -> String {
     format!("{SH_NS}{local}")
 }
 
+/// An RDF namespace as a Ladybug subgraph: the naming scope shared by terms, kept as one
+/// connected graph (RDF namespaces partition names, not data, so cross-namespace edges
+/// stay traversable). Every content node carries its `namespace`; `Namespace` nodes are
+/// the inventory, maintained by [`LadybugSchemaStore::refresh_namespaces`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceInfo {
+    /// The namespace IRI (`http://schema.org/`), i.e. the term IRIs up to and including
+    /// their last `#` or `/`.
+    pub iri: String,
+    /// Short prefix, harvested from `@prefix` declarations or derived from the IRI.
+    pub prefix: String,
+    /// RDF named graphs whose terms fall in this namespace.
+    pub graphs: Vec<String>,
+    /// Projected content nodes in this namespace.
+    pub terms: usize,
+}
+
+/// The namespace of a term IRI: up to and including its last `#`, `/` or `:` past the
+/// scheme ("" for blank labels and bare hosts).
+fn namespace_of(iri: &str) -> String {
+    if iri.starts_with("_:") {
+        return String::new();
+    }
+    match iri.rfind(['#', '/', ':']) {
+        Some(i) if i >= 8 => iri[..i + 1].to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// A term IRI without `<…>`, `^` path markers or blank-node prefixes, for namespace
+/// computation over stored display forms.
+fn bare_iri(s: &str) -> &str {
+    s.strip_prefix('^').unwrap_or(s).trim_matches(['<', '>'])
+}
+
+fn sanitize_prefix(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// A short prefix for a namespace IRI: the last path segment (`…/hr#` → `hr`), else the
+/// host's first label (`http://schema.org/` → `schema`), suffixed on collision.
+fn auto_prefix(iri: &str, taken: &mut std::collections::BTreeSet<String>) -> String {
+    let no_scheme = iri.split("://").nth(1).unwrap_or(iri);
+    let mut base = String::new();
+    let trimmed = no_scheme.trim_end_matches(['#', '/']);
+    if trimmed.contains('/') || trimmed.contains('#') {
+        if let Some(seg) = trimmed.rsplit(['#', '/']).next() {
+            base = sanitize_prefix(seg);
+        }
+    }
+    if base.is_empty() {
+        let host = no_scheme.split('/').next().unwrap_or("");
+        let host = host.strip_prefix("www.").unwrap_or(host);
+        base = sanitize_prefix(host.split('.').next().unwrap_or(""));
+    }
+    if base.is_empty() || !base.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        base = format!("ns{base}");
+    }
+    let mut i = 0;
+    loop {
+        let cand = if i == 0 {
+            base.clone()
+        } else {
+            format!("{base}{i}")
+        };
+        if taken.insert(cand.clone()) {
+            return cand;
+        }
+        i += 1;
+    }
+}
+
 /// What projecting one graph's content built (see
 /// [`Catalog::project_graph_content`](crate::Catalog::project_graph_content)).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,6 +272,8 @@ pub struct Projected {
     pub constraints: usize,
     /// `TARGETS` plus `ON_PROPERTY` links into the ontology, rebuilt over all shapes.
     pub links: usize,
+    /// Namespaces present after the refresh.
+    pub namespaces: usize,
 }
 
 impl LadybugSchemaStore {
@@ -152,25 +314,177 @@ impl LadybugSchemaStore {
     }
 
     fn ensure_table(&self) -> Result<()> {
+        // Databases written before namespaces existed have content tables without the
+        // `namespace` column (Ladybug has no ALTER TABLE): migrate them in place.
+        self.maybe_migrate_content_schema()?;
         let conn = self.connection()?;
         // `IF NOT EXISTS` keeps re-opens idempotent across lbug versions that accept it;
         // otherwise fall back to a plain CREATE and ignore "already exists".
         let mut ddls = vec![CREATE_TABLE.to_string()];
         ddls.extend(CONTENT_TABLES.iter().map(|s| s.to_string()));
         for ddl in &ddls {
-            let if_not_exists = ddl.replacen("TABLE ", "TABLE IF NOT EXISTS ", 1);
-            if conn.query(&if_not_exists).is_err() {
-                match conn.query(ddl) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if !msg.contains("already exists") && !msg.contains("Exists") {
-                            return Err(Error::Ladybug(msg));
-                        }
+            Self::create_ignoring_exists(&conn, ddl)?;
+        }
+        Ok(())
+    }
+
+    fn create_ignoring_exists(conn: &Connection<'_>, ddl: &str) -> Result<()> {
+        let if_not_exists = ddl.replacen("TABLE ", "TABLE IF NOT EXISTS ", 1);
+        if conn.query(&if_not_exists).is_err() {
+            match conn.query(ddl) {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("already exists") && !msg.contains("Exists") {
+                        return Err(Error::Ladybug(msg));
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Does `table` have a `column`? Missing tables (fresh databases) report false.
+    fn table_has_column(&self, table: &str, column: &str) -> bool {
+        self.cypher(&format!("CALL table_info('{table}') RETURN *"))
+            .map(|rows| rows.iter().any(|r| r.get(1).is_some_and(|n| n == column)))
+            .unwrap_or(false)
+    }
+
+    /// Migrates pre-namespace content tables: reads every node row and relationship,
+    /// drops and recreates the tables with the current schema, and reinserts the rows
+    /// with namespaces derived from their IRIs. Runs automatically on open; a no-op
+    /// for current databases.
+    pub(crate) fn maybe_migrate_content_schema(&self) -> Result<()> {
+        if !self.table_has_column("OntologyClass", "id")
+            || self.table_has_column("OntologyClass", "namespace")
+        {
+            return Ok(());
+        }
+        // Snapshot nodes (legacy columns) and relationships.
+        let mut nodes: Vec<(&str, Vec<Vec<String>>)> = Vec::new();
+        for (table, cols) in LEGACY_NODE_COLS {
+            let select = cols
+                .iter()
+                .map(|c| format!("n.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            nodes.push((
+                table,
+                self.cypher(&format!("MATCH (n:{table}) RETURN {select}"))?,
+            ));
+        }
+        let mut rels: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+        for (rel, from_table, to_table) in CONTENT_RELS {
+            let mut pairs = Vec::new();
+            match self.cypher(&format!(
+                "MATCH (a:{from_table})-[r:{rel}]->(b:{to_table}) RETURN a.id, b.id"
+            )) {
+                Ok(rows) => {
+                    for row in rows {
+                        if row.len() == 2 {
+                            pairs.push((row[0].clone(), row[1].clone()));
+                        }
+                    }
+                }
+                // A missing relationship table holds no relationships.
+                Err(e) if e.to_string().contains("does not exist") => {}
+                Err(e) => return Err(e),
+            }
+            rels.push((rel, pairs));
+        }
+        let conn = self.connection()?;
+        let drop = |what: &str| -> Result<()> {
+            match conn.query(&format!("DROP TABLE {what}")) {
+                Ok(_) => Ok(()),
+                // Already gone is fine.
+                Err(e) if e.to_string().contains("does not exist") => Ok(()),
+                Err(e) => Err(Error::Ladybug(e.to_string())),
+            }
+        };
+        for (rel, _, _) in CONTENT_RELS {
+            drop(rel)?;
+        }
+        for (table, _) in LEGACY_NODE_COLS {
+            drop(table)?;
+        }
+        // Recreate with the current schema (Namespace included; untouched tables are
+        // kept via tolerant creates).
+        for ddl in CONTENT_TABLES {
+            Self::create_ignoring_exists(&conn, ddl)?;
+        }
+        // Reinsert nodes, deriving namespaces from their own IRIs.
+        for (table, rows) in LEGACY_NODE_COLS
+            .iter()
+            .map(|(t, _)| t)
+            .zip(nodes.iter().map(|(_, r)| r))
+        {
+            let legacy: Vec<&str> = LEGACY_NODE_COLS
+                .iter()
+                .find(|(t, _)| t == table)
+                .expect("known table")
+                .1
+                .to_vec();
+            let iri_col = match *table {
+                "OntologyClass" | "OntologyProperty" => "iri",
+                "ShaclShape" => "shape",
+                _ => "path",
+            };
+            let iri_pos = legacy.iter().position(|c| *c == iri_col);
+            let mut create_cols: Vec<String> = legacy.iter().map(|c| c.to_string()).collect();
+            create_cols.push("namespace".to_owned());
+            let create = format!(
+                "CREATE (:{table} {{{}}})",
+                create_cols
+                    .iter()
+                    .map(|c| format!("{c}: ${c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let mut stmt = conn
+                .prepare(&create)
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            for row in rows {
+                let mut owned: Vec<(String, Value)> = legacy
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(col, cell)| (col.to_string(), cell_value(col, cell)))
+                    .collect();
+                let ns = iri_pos
+                    .and_then(|p| row.get(p))
+                    .map(|s| namespace_of(bare_iri(s)))
+                    .unwrap_or_default();
+                owned.push(("namespace".to_owned(), Value::String(ns)));
+                conn.execute(
+                    &mut stmt,
+                    owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect(),
+                )
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            }
+        }
+        // Reinsert relationships between the same node ids.
+        for ((rel, from_table, to_table), (_, pairs)) in CONTENT_RELS.iter().zip(rels.iter()) {
+            if pairs.is_empty() {
+                continue;
+            }
+            let mut stmt = conn
+                .prepare(&format!(
+                    "MATCH (a:{from_table}) WHERE a.id = $from MATCH (b:{to_table}) WHERE b.id = $to \
+                     CREATE (a)-[:{rel}]->(b)"
+                ))
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            for (from, to) in pairs {
+                conn.execute(
+                    &mut stmt,
+                    vec![
+                        ("from", Value::String(from.clone())),
+                        ("to", Value::String(to.clone())),
+                    ],
+                )
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            }
+        }
+        self.refresh_namespaces()?;
         Ok(())
     }
 
@@ -592,13 +906,14 @@ impl LadybugSchemaStore {
         let mut have_props = self.existing_ids("OntologyProperty")?;
         let mut mk_class = conn
             .prepare(
-                "CREATE (:OntologyClass {id: $id, iri: $iri, label: $label, comment: $comment, graph: $graph})",
+                "CREATE (:OntologyClass {id: $id, iri: $iri, label: $label, comment: $comment, \
+                 namespace: $namespace, graph: $graph})",
             )
             .map_err(|e| Error::Ladybug(e.to_string()))?;
         let mut mk_prop = conn
             .prepare(
                 "CREATE (:OntologyProperty {id: $id, iri: $iri, kind: $kind, label: $label, \
-                 comment: $comment, rangeDatatypes: $rangeDatatypes, graph: $graph})",
+                 comment: $comment, rangeDatatypes: $rangeDatatypes, namespace: $namespace, graph: $graph})",
             )
             .map_err(|e| Error::Ladybug(e.to_string()))?;
         let mut class_nodes = 0;
@@ -638,6 +953,7 @@ impl LadybugSchemaStore {
         }
         for (id, iri, label, comment) in class_rows {
             if have_classes.insert(id.clone()) {
+                let ns = namespace_of(&iri);
                 conn.execute(
                     &mut mk_class,
                     vec![
@@ -645,6 +961,7 @@ impl LadybugSchemaStore {
                         ("iri", Value::String(iri)),
                         ("label", Value::String(label)),
                         ("comment", Value::String(comment)),
+                        ("namespace", Value::String(ns)),
                         ("graph", Value::String(glabel.clone())),
                     ],
                 )
@@ -657,6 +974,7 @@ impl LadybugSchemaStore {
             let id = content_id(&glabel, iri);
             if have_props.insert(id.clone()) {
                 let dts = datatypes.get(iri).cloned().unwrap_or_default();
+                let ns = namespace_of(iri);
                 conn.execute(
                     &mut mk_prop,
                     vec![
@@ -669,6 +987,7 @@ impl LadybugSchemaStore {
                             "rangeDatatypes",
                             Value::String(serde_json::to_string(&dts)?),
                         ),
+                        ("namespace", Value::String(ns)),
                         ("graph", Value::String(glabel.clone())),
                     ],
                 )
@@ -698,6 +1017,7 @@ impl LadybugSchemaStore {
             }
             let dts = datatypes.get(&iri).cloned().unwrap_or_default();
             if have_props.insert(id.clone()) {
+                let ns = namespace_of(&iri);
                 conn.execute(
                     &mut mk_prop,
                     vec![
@@ -710,6 +1030,7 @@ impl LadybugSchemaStore {
                             "rangeDatatypes",
                             Value::String(serde_json::to_string(&dts)?),
                         ),
+                        ("namespace", Value::String(ns)),
                         ("graph", Value::String(glabel.clone())),
                     ],
                 )
@@ -816,7 +1137,7 @@ impl LadybugSchemaStore {
                 "CREATE (:ShaclShape {id: $id, shape: $shape, targetClasses: $targetClasses, \
                  targetNodes: $targetNodes, targetSubjectsOf: $targetSubjectsOf, \
                  targetObjectsOf: $targetObjectsOf, message: $message, severity: $severity, \
-                 deactivated: $deactivated, graph: $graph})",
+                 deactivated: $deactivated, namespace: $namespace, graph: $graph})",
             )
             .map_err(|e| Error::Ladybug(e.to_string()))?;
         let mut mk_prop = conn
@@ -824,7 +1145,8 @@ impl LadybugSchemaStore {
                 "CREATE (:ShaclProperty {id: $id, shapeId: $shapeId, path: $path, datatype: $datatype, \
                  class: $class, nodeKind: $nodeKind, minCount: $minCount, maxCount: $maxCount, \
                  pattern: $pattern, minInclusive: $minInclusive, maxInclusive: $maxInclusive, \
-                 message: $message, severity: $severity, deactivated: $deactivated, graph: $graph})",
+                 message: $message, severity: $severity, deactivated: $deactivated, \
+                 namespace: $namespace, graph: $graph})",
             )
             .map_err(|e| Error::Ladybug(e.to_string()))?;
         let mut mk_has = conn
@@ -932,6 +1254,7 @@ impl LadybugSchemaStore {
                         "deactivated",
                         Value::Bool(is_true(objs(&key, &sh("deactivated")))),
                     ),
+                    ("namespace", Value::String(namespace_of(bare_iri(&key)))),
                     ("graph", Value::String(glabel.clone())),
                 ],
             )
@@ -968,7 +1291,7 @@ impl LadybugSchemaStore {
                     vec![
                         ("id", Value::String(cid.clone())),
                         ("shapeId", Value::String(sid.clone())),
-                        ("path", Value::String(path)),
+                        ("path", Value::String(path.clone())),
                         (
                             "datatype",
                             Value::String(first_iri(objs(pkey, &sh("datatype")))),
@@ -1004,6 +1327,7 @@ impl LadybugSchemaStore {
                             "deactivated",
                             Value::Bool(is_true(objs(pkey, &sh("deactivated")))),
                         ),
+                        ("namespace", Value::String(namespace_of(bare_iri(&path)))),
                         ("graph", Value::String(glabel.clone())),
                     ],
                 )
@@ -1088,11 +1412,322 @@ impl LadybugSchemaStore {
         Ok(count("MATCH ()-[r:TARGETS]->() RETURN count(r)")?
             + count("MATCH ()-[r:ON_PROPERTY]->() RETURN count(r)")?)
     }
+
+    /// Runs Cypher with parameters (see [`Self::cypher`]), returning display strings.
+    pub fn cypher_params(
+        &self,
+        cypher: &str,
+        params: Vec<(&str, Value)>,
+    ) -> Result<Vec<Vec<String>>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(cypher)
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        let result = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        Ok(result
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .collect())
+    }
+
+    /// Records an explicit prefix for a namespace IRI (e.g. harvested from a Turtle
+    /// document's `@prefix` declarations). The prefix sticks: [`Self::refresh_namespaces`]
+    /// keeps existing prefixes and only derives new ones. A prefix taken by another
+    /// namespace is left alone.
+    pub fn set_prefix(&self, iri: &str, prefix: &str) -> Result<()> {
+        if iri.is_empty() || prefix.is_empty() {
+            return Ok(());
+        }
+        let rows = self.cypher_params("MATCH (n:Namespace) RETURN n.iri, n.prefix", vec![])?;
+        let mut taken: std::collections::BTreeSet<String> = BTreeSet::new();
+        let mut owned: Option<String> = None;
+        for row in rows {
+            if row.len() < 2 {
+                continue;
+            }
+            taken.insert(row[1].clone());
+            if row[0] == iri {
+                owned = Some(row[1].clone());
+            }
+        }
+        if owned.as_deref() == Some(prefix) {
+            return Ok(());
+        }
+        if taken.contains(prefix) {
+            return Ok(());
+        }
+        let conn = self.connection()?;
+        if owned.is_some() {
+            let mut stmt = conn
+                .prepare("MATCH (n:Namespace) WHERE n.iri = $iri SET n.prefix = $prefix")
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("iri", Value::String(iri.to_owned())),
+                    ("prefix", Value::String(prefix.to_owned())),
+                ],
+            )
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "CREATE (:Namespace {iri: $iri, prefix: $prefix, sourceGraphs: $graphs, termCount: $count})",
+                )
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("iri", Value::String(iri.to_owned())),
+                    ("prefix", Value::String(prefix.to_owned())),
+                    ("graphs", Value::String("[]".to_owned())),
+                    ("count", Value::Int64(0)),
+                ],
+            )
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Backfills the `namespace` property on content nodes projected before namespaces
+    /// existed (or with an empty one), deriving it from each node's own IRI.
+    fn backfill_namespaces(&self) -> Result<()> {
+        let conn = self.connection()?;
+        for (table, source) in [
+            ("OntologyClass", "iri"),
+            ("OntologyProperty", "iri"),
+            ("ShaclShape", "shape"),
+            ("ShaclProperty", "path"),
+        ] {
+            let rows = self.cypher(&format!(
+                "MATCH (n:{table}) WHERE n.namespace IS NULL OR n.namespace = '' \
+                 RETURN n.id, n.{source}"
+            ))?;
+            if rows.is_empty() {
+                continue;
+            }
+            let mut stmt = conn
+                .prepare(&format!(
+                    "MATCH (n:{table}) WHERE n.id = $id SET n.namespace = $namespace"
+                ))
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            for row in rows {
+                if row.len() < 2 {
+                    continue;
+                }
+                conn.execute(
+                    &mut stmt,
+                    vec![
+                        ("id", Value::String(row[0].clone())),
+                        ("namespace", Value::String(namespace_of(bare_iri(&row[1])))),
+                    ],
+                )
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the `Namespace` inventory from the projected content: one node per
+    /// namespace with its term count and source graphs. Existing prefixes stick;
+    /// brand-new namespaces get derived ones. Returns the number of namespaces.
+    pub fn refresh_namespaces(&self) -> Result<usize> {
+        self.backfill_namespaces()?;
+        let mut prefixes: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for row in self.cypher("MATCH (n:Namespace) RETURN n.iri, n.prefix")? {
+            if row.len() == 2 && !row[1].is_empty() {
+                prefixes.insert(row[0].clone(), row[1].clone());
+            }
+        }
+        let mut taken: std::collections::BTreeSet<String> = prefixes.values().cloned().collect();
+        let mut terms: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
+            std::collections::BTreeMap::new();
+        for table in [
+            "OntologyClass",
+            "OntologyProperty",
+            "ShaclShape",
+            "ShaclProperty",
+        ] {
+            for row in self.cypher(&format!(
+                "MATCH (n:{table}) WHERE NOT n.namespace = '' RETURN n.namespace, n.graph"
+            ))? {
+                if row.len() < 2 || row[0].is_empty() {
+                    continue;
+                }
+                let e = terms.entry(row[0].clone()).or_insert((0, BTreeSet::new()));
+                e.0 += 1;
+                e.1.insert(row[1].clone());
+            }
+        }
+        let conn = self.connection()?;
+        conn.query("MATCH (n:Namespace) DETACH DELETE n")
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        let mut mk = conn
+            .prepare(
+                "CREATE (:Namespace {iri: $iri, prefix: $prefix, sourceGraphs: $graphs, termCount: $count})",
+            )
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        for (iri, (count, graphs)) in &terms {
+            let prefix = prefixes
+                .get(iri)
+                .cloned()
+                .unwrap_or_else(|| auto_prefix(iri, &mut taken));
+            taken.insert(prefix.clone());
+            let graphs: Vec<String> = graphs.iter().cloned().collect();
+            conn.execute(
+                &mut mk,
+                vec![
+                    ("iri", Value::String(iri.clone())),
+                    ("prefix", Value::String(prefix)),
+                    ("graphs", Value::String(serde_json::to_string(&graphs)?)),
+                    ("count", Value::Int64(*count as i64)),
+                ],
+            )
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        }
+        Ok(terms.len())
+    }
+
+    /// Every namespace, ordered by prefix.
+    pub fn list_namespaces(&self) -> Result<Vec<NamespaceInfo>> {
+        let mut out = Vec::new();
+        for row in
+            self.cypher("MATCH (n:Namespace) RETURN n.iri, n.prefix, n.sourceGraphs, n.termCount ORDER BY n.prefix")?
+        {
+            if row.len() < 4 {
+                continue;
+            }
+            let graphs: Vec<String> = serde_json::from_str(&row[2]).unwrap_or_default();
+            out.push(NamespaceInfo {
+                iri: row[0].clone(),
+                prefix: row[1].clone(),
+                graphs,
+                terms: row[3].parse().unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_pre_namespace_databases() {
+        let store = LadybugSchemaStore::open_in_memory().unwrap();
+        // Downgrade to the legacy schema: drop the new tables, recreate them without
+        // the `namespace` column, and fill them the old way.
+        let conn = store.connection().unwrap();
+        for (rel, _, _) in CONTENT_RELS {
+            conn.query(&format!("DROP TABLE {rel}")).unwrap();
+        }
+        for (table, cols) in LEGACY_NODE_COLS {
+            conn.query(&format!("DROP TABLE {table}")).unwrap();
+            let defs = cols
+                .iter()
+                .map(|c| {
+                    if *c == "id" {
+                        format!("{c} STRING PRIMARY KEY")
+                    } else if is_int_col(c) {
+                        format!("{c} INT64")
+                    } else if is_bool_col(c) {
+                        format!("{c} BOOLEAN")
+                    } else {
+                        format!("{c} STRING")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.query(&format!("CREATE NODE TABLE {table}({defs})"))
+                .unwrap();
+        }
+        for ddl in [
+            "CREATE REL TABLE SUBCLASS_OF(FROM OntologyClass TO OntologyClass)",
+            "CREATE REL TABLE HAS_CONSTRAINT(FROM ShaclShape TO ShaclProperty)",
+            "CREATE REL TABLE TARGETS(FROM ShaclShape TO OntologyClass)",
+        ] {
+            conn.query(ddl).unwrap();
+        }
+        store
+            .cypher("CREATE (:OntologyClass {id: 'g\u{1f}http://ex.org/C1', iri: 'http://ex.org/C1', label: '', comment: '', graph: 'g'})")
+            .unwrap();
+        store
+            .cypher("CREATE (:OntologyClass {id: 'g\u{1f}http://ex.org/C2', iri: 'http://ex.org/C2', label: '', comment: '', graph: 'g'})")
+            .unwrap();
+        store
+            .cypher("MATCH (a:OntologyClass), (b:OntologyClass) WHERE a.iri = 'http://ex.org/C1' AND b.iri = 'http://ex.org/C2' CREATE (a)-[:SUBCLASS_OF]->(b)")
+            .unwrap();
+        // minCount omitted: NULL must survive the migration.
+        store
+            .cypher("CREATE (:ShaclShape {id: 'g\u{1f}<http://ex.org/S>', shape: '<http://ex.org/S>', targetClasses: '[\"http://ex.org/C2\"]', targetNodes: '[]', targetSubjectsOf: '[]', targetObjectsOf: '[]', message: '', severity: '', deactivated: false, graph: 'g'})")
+            .unwrap();
+        store
+            .cypher("CREATE (:ShaclProperty {id: 'c', shapeId: 's', path: 'http://ex.org/p', datatype: '', class: '', nodeKind: '', pattern: '', minInclusive: '', maxInclusive: '', message: '', severity: '', deactivated: false, graph: 'g'})")
+            .unwrap();
+        store
+            .cypher("MATCH (s:ShaclShape), (p:ShaclProperty) CREATE (s)-[:HAS_CONSTRAINT]->(p)")
+            .unwrap();
+        store
+            .cypher("MATCH (s:ShaclShape), (c:OntologyClass) WHERE c.iri = 'http://ex.org/C2' CREATE (s)-[:TARGETS]->(c)")
+            .unwrap();
+        assert!(!store.table_has_column("OntologyClass", "namespace"));
+        store.maybe_migrate_content_schema().unwrap();
+        assert!(store.table_has_column("OntologyClass", "namespace"));
+        // Rows, edges and NULLs preserved; namespaces derived and inventoried.
+        assert_eq!(
+            store
+                .cypher("MATCH (c:OntologyClass) RETURN count(c)")
+                .unwrap(),
+            vec![vec!["2".to_owned()]]
+        );
+        assert_eq!(
+            store
+                .cypher("MATCH ()-[r:SUBCLASS_OF]->() RETURN count(r)")
+                .unwrap(),
+            vec![vec!["1".to_owned()]]
+        );
+        assert_eq!(
+            store
+                .cypher("MATCH ()-[r:HAS_CONSTRAINT]->() RETURN count(r)")
+                .unwrap(),
+            vec![vec!["1".to_owned()]]
+        );
+        assert_eq!(
+            store
+                .cypher("MATCH (p:ShaclProperty) RETURN p.minCount")
+                .unwrap(),
+            vec![vec![String::new()]]
+        );
+        let ns = store.list_namespaces().unwrap();
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].iri, "http://ex.org/");
+        assert_eq!(ns[0].prefix, "ex");
+        assert_eq!(ns[0].terms, 4);
+        // Second run is a no-op.
+        store.maybe_migrate_content_schema().unwrap();
+        assert_eq!(store.list_namespaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backfill_repairs_nodes_without_a_namespace() {
+        let store = LadybugSchemaStore::open_in_memory().unwrap();
+        // As written by projections predating namespaces: no namespace property.
+        store
+            .cypher(
+                "CREATE (:OntologyClass {id: 'g\u{1f}http://ex.org/C', iri: 'http://ex.org/C', \
+                 label: '', comment: '', graph: 'g'})",
+            )
+            .unwrap();
+        assert_eq!(store.refresh_namespaces().unwrap(), 1);
+        let ns = store.list_namespaces().unwrap();
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].iri, "http://ex.org/");
+        assert_eq!(ns[0].prefix, "ex");
+        assert_eq!(ns[0].terms, 1);
+    }
 
     fn entry(graph: &str, role: SchemaRole) -> SchemaGraph {
         let mut e = SchemaGraph::new(GraphName::NamedNode(NamedNode::new(graph).unwrap()), role);
