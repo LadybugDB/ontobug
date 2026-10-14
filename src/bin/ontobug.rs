@@ -20,7 +20,8 @@ use std::process::ExitCode;
     about = "Vocabulary and ontology management for RDF datasets"
 )]
 struct Cli {
-    /// The dataset file (TriG `.trig` or N-Quads `.nq`). Created when missing.
+    /// The dataset file: an RDF snapshot (TriG `.trig` or N-Quads `.nq`) written by
+    /// save/export and read only to seed an empty registry. Created when missing.
     #[arg(short, long, env = "ONTOBUG_DATASET", default_value = "dataset.trig")]
     dataset: PathBuf,
     /// The Ladybug registry database (`.lbdb`). Defaults to the dataset stem, e.g.
@@ -338,10 +339,11 @@ fn run(cli: Cli) -> ontobug::Result<ExitCode> {
                     .iter()
                     .map(|n| {
                         vec![format!(
-                            "{:<10} {:<45} {:>5} terms  {}",
+                            "{:<10} {:<45} {:>5} terms {:>5} triples  {}",
                             n.prefix,
                             n.iri,
                             n.terms,
+                            n.triples,
                             n.graphs.join(" ")
                         )]
                     })

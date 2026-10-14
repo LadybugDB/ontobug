@@ -68,7 +68,7 @@ git clone <this repo> ontobug && cd ontobug
 cargo install --path .          # installs the `ontobug` binary
 ```
 
-Every command works on one dataset: RDF content in a file, given with `--dataset` (`-d`) or `ONTOBUG_DATASET` (default `dataset.trig`; TriG or N-Quads, created when missing), and the registry in a Ladybug database, given with `--ladybug` (`-l`) or `ONTOBUG_LADYBUG` (default: the dataset stem with `.lbdb`, so `hr.trig` goes with `hr.lbdb`). Each command that changes RDF rewrites the content file atomically; the registry needs no saving, Ladybug persists it as it changes.
+Every command works on one dataset, and the dataset is the Ladybug database, given with `--ladybug` (`-l`) or `ONTOBUG_LADYBUG` (default: the dataset stem with `.lbdb`, so `hr.trig` goes with `hr.lbdb`). It holds every triple losslessly as `DataTriple` rows, plus the registry and the projected schemas. `--dataset` (`-d`, `ONTOBUG_DATASET`, default `dataset.trig`) is the TriG/N-Quads snapshot: each command that changes content rewrites it atomically, and opening with an empty database seeds from it.
 
 The whole HR walkthrough in one go:
 
@@ -796,18 +796,19 @@ c.save("hr.trig")?;
 
 | `Catalog` method | Does |
 |---|---|
-| `new`, `open(data, registry)`, `save(data)`, `store()`, `registry()` | Create, load and save the dataset; reach the Oxigraph store and the Ladybug registry underneath |
+| `new`, `open(data, registry)`, `save(data)`, `registry()` | Create the dataset in Ladybug; seed an empty one from a snapshot; write snapshots; reach the database underneath |
 | `default_registry_path(dataset)` | The `.lbdb` path for a dataset file |
-| `add(role, graph, bytes, format, &AddOptions)` | Load a schema document, register it, and project it as nodes and edges |
+| `add(role, graph, bytes, format, &AddOptions)` | Load a schema document as triples, register it, and project it as nodes and edges |
 | `register(&SchemaGraph)` | Write a registration as given |
 | `project_graph_content(g)` | (Re)build a graph's nodes and edges; returns counts |
-| `load(graph, bytes, format, replace)` | Load data |
+| `load(graph, bytes, format, replace)` | Load triples (data or schema) |
+| `graph_ntriples(g)`, `graph_len(g)` | A graph's triples / count, reconstructed from its rows |
 | `list()`, `is_registered(g)`, `schemas_for(g, role)` | Read the registry; resolve scopes, imports included |
 | `map(g, &targets)`, `set_active(g, bool)`, `unregister(g)`, `drop_graph(g)` | Change registrations (`drop_graph` also removes the projection and the triples) |
 | `problems()` | Check the registry structurally |
 | `verify(g, bytes)` | Detect drift |
-| `validate(g, &ValidateOptions)`, `validate_shex(g, shexc, base, map)` | Validate |
-| `cypher(cypher)` | Run Cypher against the registry; rows of display strings |
+| `validate(g, &ValidateOptions)`, `validate_shex(g, shexc, base, map)` | Validate from the triple rows |
+| `cypher(cypher)`, `namespaces()` | Run Cypher against the database; list the namespace subgraphs |
 
 ## 15. Registry schema reference
 
@@ -815,7 +816,8 @@ One `SchemaEntry` node per registration (`id` is graph plus role): `graph`, `rol
 (`ontology`, `shacl`, `shex`), `ontologyIri`, `version`, `sha256`, `active`, `loadedAt`,
 and the `appliesTo` / `imports` lists as JSON arrays (empty `appliesTo` is every graph).
 
-Projected content, rebuilt by `add` and `ontobug project`:
+Projected content, rebuilt by `add` and `ontobug project` (every content node also
+carries its `namespace`):
 
 | Table | Kind | Properties / meaning |
 |---|---|---|
@@ -828,6 +830,8 @@ Projected content, rebuilt by `add` and `ontobug project`:
 | `HAS_CONSTRAINT` | rel | Shape to its property constraints |
 | `TARGETS` | rel | Shape to the classes of its target classes, whatever graph defined them |
 | `ON_PROPERTY` | rel | Constraint to the property of its path |
+| `Namespace` | node | `iri`, `prefix`, `sourceGraphs` (JSON), `termCount`, `triples` |
+| `DataTriple` | node | `subject`, `predicate`, `object` as N-Triples tokens, `lex` (unescaped literal value), `namespace`, `graph`; `id` is graph plus zero-padded ordinal, so `ORDER BY id` reproduces document order |
 | `Namespace` | node | `iri`, `prefix`, `sourceGraphs` (JSON), `termCount`; one per namespace in the projected content |
 
 ## 16. Compatibility and limits
@@ -840,10 +844,11 @@ still validates it ([§13](#13-using-another-shacl-processor)).
 
 **Limits:**
 
-- **Storage.** RDF content is held in memory and saved to one TriG/N-Quads file; the
-registry and the projected schemas live in a Ladybug `.lbdb` database.
-- **Projection is one-way.** Ladybug mirrors the RDF graphs for querying; validation
-still reads RDF. Edit the documents, `add` them again, and the projection rebuilds.
+- **Storage.** Everything lives in a Ladybug `.lbdb` database: triple rows, registry
+and projections. TriG/N-Quads files are snapshots — written by save/export, read only
+to seed an empty database.
+- **Projection is one-way.** Ladybug mirrors the RDF graphs for querying; edit the
+documents, `add` them again, and the projection rebuilds.
 - **No OWL reasoner.** Ontologies take part in validation through class membership only (§8.3). Ontobug checks neither OWL consistency nor property characteristics.
 - **No fetching.** Imports resolve only against registered ontologies.
 - **No blank-node graphs.** A graph named by a blank node cannot be registered, because no other graph can name it.

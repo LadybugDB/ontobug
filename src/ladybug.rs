@@ -17,7 +17,7 @@
 use crate::error::{Error, Result};
 use crate::registry::{SchemaGraph, SchemaRole, RDF_TYPE};
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
-use oxrdf::{GraphName, NamedNode};
+use oxrdf::{GraphName, GraphNameRef, NamedNode};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -54,8 +54,9 @@ const CREATE_TABLE: &str = "CREATE NODE TABLE SchemaEntry(\
     imports STRING)";
 
 /// Node and relationship tables for projected schema content: the schemas themselves as
-/// a property graph (see [`LadybugSchemaStore::project_ontology`]).
-const CONTENT_TABLES: [&str; 12] = [
+/// a property graph (see [`LadybugSchemaStore::project_ontology`]), plus the lossless
+/// triple store underneath it all (see [`LadybugSchemaStore::insert_triples`]).
+const CONTENT_TABLES: [&str; 14] = [
     "CREATE NODE TABLE OntologyClass(\
         id STRING PRIMARY KEY, iri STRING, label STRING, comment STRING, namespace STRING, graph STRING)",
     "CREATE NODE TABLE OntologyProperty(\
@@ -78,91 +79,14 @@ const CONTENT_TABLES: [&str; 12] = [
     "CREATE REL TABLE TARGETS(FROM ShaclShape TO OntologyClass)",
     "CREATE REL TABLE ON_PROPERTY(FROM ShaclProperty TO OntologyProperty)",
     "CREATE NODE TABLE Namespace(\
-        iri STRING PRIMARY KEY, prefix STRING, sourceGraphs STRING, termCount INT64)",
+        iri STRING PRIMARY KEY, prefix STRING, sourceGraphs STRING, termCount INT64, triples INT64)",
+    "CREATE NODE TABLE RdfNode(\
+        id STRING PRIMARY KEY, kind STRING, value STRING, datatype STRING, lang STRING, namespace STRING)",
+    "CREATE REL TABLE Statement(\
+        FROM RdfNode TO RdfNode, predicate STRING, graph STRING, namespace STRING, ord INT64)",
 ];
 
 /// Content relationship tables with their endpoint node tables.
-const CONTENT_RELS: [(&str, &str, &str); 7] = [
-    ("SUBCLASS_OF", "OntologyClass", "OntologyClass"),
-    ("EQUIVALENT_CLASS", "OntologyClass", "OntologyClass"),
-    ("DOMAIN", "OntologyProperty", "OntologyClass"),
-    ("RANGE", "OntologyProperty", "OntologyClass"),
-    ("HAS_CONSTRAINT", "ShaclShape", "ShaclProperty"),
-    ("TARGETS", "ShaclShape", "OntologyClass"),
-    ("ON_PROPERTY", "ShaclProperty", "OntologyProperty"),
-];
-
-/// Content node tables with the columns they had before the `namespace` column existed.
-const LEGACY_NODE_COLS: [(&str, &[&str]); 4] = [
-    ("OntologyClass", &["id", "iri", "label", "comment", "graph"]),
-    (
-        "OntologyProperty",
-        &[
-            "id",
-            "iri",
-            "kind",
-            "label",
-            "comment",
-            "rangeDatatypes",
-            "graph",
-        ],
-    ),
-    (
-        "ShaclShape",
-        &[
-            "id",
-            "shape",
-            "targetClasses",
-            "targetNodes",
-            "targetSubjectsOf",
-            "targetObjectsOf",
-            "message",
-            "severity",
-            "deactivated",
-            "graph",
-        ],
-    ),
-    (
-        "ShaclProperty",
-        &[
-            "id",
-            "shapeId",
-            "path",
-            "datatype",
-            "class",
-            "nodeKind",
-            "minCount",
-            "maxCount",
-            "pattern",
-            "minInclusive",
-            "maxInclusive",
-            "message",
-            "severity",
-            "deactivated",
-            "graph",
-        ],
-    ),
-];
-
-fn is_int_col(col: &str) -> bool {
-    matches!(col, "minCount" | "maxCount" | "termCount")
-}
-
-fn is_bool_col(col: &str) -> bool {
-    matches!(col, "deactivated" | "active")
-}
-
-/// A display-string cell back into a value: empty counts become NULL, booleans parse.
-fn cell_value(col: &str, cell: &str) -> Value {
-    if is_int_col(col) {
-        return opt_int(cell.parse().ok());
-    }
-    if is_bool_col(col) {
-        return Value::Bool(cell == "True" || cell == "true" || cell == "1");
-    }
-    Value::String(cell.to_owned())
-}
-
 // RDF predicates read while projecting schema content.
 const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
@@ -200,6 +124,32 @@ pub struct NamespaceInfo {
     pub graphs: Vec<String>,
     /// Projected content nodes in this namespace.
     pub terms: usize,
+    /// Triple rows whose subject falls in this namespace.
+    pub triples: usize,
+}
+
+/// One RDF triple as stored losslessly in Ladybug: subject/predicate/object are
+/// N-Triples tokens (`<iri>`, `_:label`, `"lex"^^<dt>`, `"lex"@lang`), so rows
+/// concatenate back to byte-exact N-Triples; `lex` is the unescaped literal value
+/// ("" for non-literals); `graph` is a graph token (see [`graph_token`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripleRow {
+    pub graph: String,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub lex: String,
+    pub namespace: String,
+}
+
+/// A graph name as stored in triple rows: the N-Triples token for named (`<iri>`) and
+/// blank (`_:label`) graphs, `DEFAULT` for the default graph.
+pub(crate) fn graph_token(graph: GraphNameRef<'_>) -> String {
+    match graph {
+        GraphNameRef::NamedNode(n) => n.to_string(),
+        GraphNameRef::DefaultGraph => DEFAULT_LABEL.to_owned(),
+        GraphNameRef::BlankNode(b) => b.to_string(),
+    }
 }
 
 /// The namespace of a term IRI: up to and including its last `#`, `/` or `:` past the
@@ -314,9 +264,6 @@ impl LadybugSchemaStore {
     }
 
     fn ensure_table(&self) -> Result<()> {
-        // Databases written before namespaces existed have content tables without the
-        // `namespace` column (Ladybug has no ALTER TABLE): migrate them in place.
-        self.maybe_migrate_content_schema()?;
         let conn = self.connection()?;
         // `IF NOT EXISTS` keeps re-opens idempotent across lbug versions that accept it;
         // otherwise fall back to a plain CREATE and ignore "already exists".
@@ -325,6 +272,22 @@ impl LadybugSchemaStore {
         for ddl in &ddls {
             Self::create_ignoring_exists(&conn, ddl)?;
         }
+        // Databases written before a column existed gain it here: `ADD IF NOT EXISTS`
+        // NULL-fills existing rows, and the backfill derives their values.
+        for (table, column, dtype) in [
+            ("OntologyClass", "namespace", "STRING"),
+            ("OntologyProperty", "namespace", "STRING"),
+            ("ShaclShape", "namespace", "STRING"),
+            ("ShaclProperty", "namespace", "STRING"),
+            ("Namespace", "triples", "INT64"),
+        ] {
+            conn.query(&format!(
+                "ALTER TABLE {table} ADD IF NOT EXISTS {column} {dtype}"
+            ))
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        }
+        self.backfill_namespaces()?;
+        self.refresh_namespaces()?;
         Ok(())
     }
 
@@ -341,150 +304,6 @@ impl LadybugSchemaStore {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Does `table` have a `column`? Missing tables (fresh databases) report false.
-    fn table_has_column(&self, table: &str, column: &str) -> bool {
-        self.cypher(&format!("CALL table_info('{table}') RETURN *"))
-            .map(|rows| rows.iter().any(|r| r.get(1).is_some_and(|n| n == column)))
-            .unwrap_or(false)
-    }
-
-    /// Migrates pre-namespace content tables: reads every node row and relationship,
-    /// drops and recreates the tables with the current schema, and reinserts the rows
-    /// with namespaces derived from their IRIs. Runs automatically on open; a no-op
-    /// for current databases.
-    pub(crate) fn maybe_migrate_content_schema(&self) -> Result<()> {
-        if !self.table_has_column("OntologyClass", "id")
-            || self.table_has_column("OntologyClass", "namespace")
-        {
-            return Ok(());
-        }
-        // Snapshot nodes (legacy columns) and relationships.
-        let mut nodes: Vec<(&str, Vec<Vec<String>>)> = Vec::new();
-        for (table, cols) in LEGACY_NODE_COLS {
-            let select = cols
-                .iter()
-                .map(|c| format!("n.{c}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            nodes.push((
-                table,
-                self.cypher(&format!("MATCH (n:{table}) RETURN {select}"))?,
-            ));
-        }
-        let mut rels: Vec<(&str, Vec<(String, String)>)> = Vec::new();
-        for (rel, from_table, to_table) in CONTENT_RELS {
-            let mut pairs = Vec::new();
-            match self.cypher(&format!(
-                "MATCH (a:{from_table})-[r:{rel}]->(b:{to_table}) RETURN a.id, b.id"
-            )) {
-                Ok(rows) => {
-                    for row in rows {
-                        if row.len() == 2 {
-                            pairs.push((row[0].clone(), row[1].clone()));
-                        }
-                    }
-                }
-                // A missing relationship table holds no relationships.
-                Err(e) if e.to_string().contains("does not exist") => {}
-                Err(e) => return Err(e),
-            }
-            rels.push((rel, pairs));
-        }
-        let conn = self.connection()?;
-        let drop = |what: &str| -> Result<()> {
-            match conn.query(&format!("DROP TABLE {what}")) {
-                Ok(_) => Ok(()),
-                // Already gone is fine.
-                Err(e) if e.to_string().contains("does not exist") => Ok(()),
-                Err(e) => Err(Error::Ladybug(e.to_string())),
-            }
-        };
-        for (rel, _, _) in CONTENT_RELS {
-            drop(rel)?;
-        }
-        for (table, _) in LEGACY_NODE_COLS {
-            drop(table)?;
-        }
-        // Recreate with the current schema (Namespace included; untouched tables are
-        // kept via tolerant creates).
-        for ddl in CONTENT_TABLES {
-            Self::create_ignoring_exists(&conn, ddl)?;
-        }
-        // Reinsert nodes, deriving namespaces from their own IRIs.
-        for (table, rows) in LEGACY_NODE_COLS
-            .iter()
-            .map(|(t, _)| t)
-            .zip(nodes.iter().map(|(_, r)| r))
-        {
-            let legacy: Vec<&str> = LEGACY_NODE_COLS
-                .iter()
-                .find(|(t, _)| t == table)
-                .expect("known table")
-                .1
-                .to_vec();
-            let iri_col = match *table {
-                "OntologyClass" | "OntologyProperty" => "iri",
-                "ShaclShape" => "shape",
-                _ => "path",
-            };
-            let iri_pos = legacy.iter().position(|c| *c == iri_col);
-            let mut create_cols: Vec<String> = legacy.iter().map(|c| c.to_string()).collect();
-            create_cols.push("namespace".to_owned());
-            let create = format!(
-                "CREATE (:{table} {{{}}})",
-                create_cols
-                    .iter()
-                    .map(|c| format!("{c}: ${c}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let mut stmt = conn
-                .prepare(&create)
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-            for row in rows {
-                let mut owned: Vec<(String, Value)> = legacy
-                    .iter()
-                    .zip(row.iter())
-                    .map(|(col, cell)| (col.to_string(), cell_value(col, cell)))
-                    .collect();
-                let ns = iri_pos
-                    .and_then(|p| row.get(p))
-                    .map(|s| namespace_of(bare_iri(s)))
-                    .unwrap_or_default();
-                owned.push(("namespace".to_owned(), Value::String(ns)));
-                conn.execute(
-                    &mut stmt,
-                    owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect(),
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-            }
-        }
-        // Reinsert relationships between the same node ids.
-        for ((rel, from_table, to_table), (_, pairs)) in CONTENT_RELS.iter().zip(rels.iter()) {
-            if pairs.is_empty() {
-                continue;
-            }
-            let mut stmt = conn
-                .prepare(&format!(
-                    "MATCH (a:{from_table}) WHERE a.id = $from MATCH (b:{to_table}) WHERE b.id = $to \
-                     CREATE (a)-[:{rel}]->(b)"
-                ))
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-            for (from, to) in pairs {
-                conn.execute(
-                    &mut stmt,
-                    vec![
-                        ("from", Value::String(from.clone())),
-                        ("to", Value::String(to.clone())),
-                    ],
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-            }
-        }
-        self.refresh_namespaces()?;
         Ok(())
     }
 
@@ -904,19 +723,7 @@ impl LadybugSchemaStore {
         let conn = self.connection()?;
         let mut have_classes = self.existing_ids("OntologyClass")?;
         let mut have_props = self.existing_ids("OntologyProperty")?;
-        let mut mk_class = conn
-            .prepare(
-                "CREATE (:OntologyClass {id: $id, iri: $iri, label: $label, comment: $comment, \
-                 namespace: $namespace, graph: $graph})",
-            )
-            .map_err(|e| Error::Ladybug(e.to_string()))?;
-        let mut mk_prop = conn
-            .prepare(
-                "CREATE (:OntologyProperty {id: $id, iri: $iri, kind: $kind, label: $label, \
-                 comment: $comment, rangeDatatypes: $rangeDatatypes, namespace: $namespace, graph: $graph})",
-            )
-            .map_err(|e| Error::Ladybug(e.to_string()))?;
-        let mut class_nodes = 0;
+        let mut class_inserts: Vec<Vec<Value>> = Vec::new();
         let mut class_rows: Vec<(String, String, String, String)> = classes
             .iter()
             .map(|(iri, (label, comment))| {
@@ -954,45 +761,44 @@ impl LadybugSchemaStore {
         for (id, iri, label, comment) in class_rows {
             if have_classes.insert(id.clone()) {
                 let ns = namespace_of(&iri);
-                conn.execute(
-                    &mut mk_class,
-                    vec![
-                        ("id", Value::String(id)),
-                        ("iri", Value::String(iri)),
-                        ("label", Value::String(label)),
-                        ("comment", Value::String(comment)),
-                        ("namespace", Value::String(ns)),
-                        ("graph", Value::String(glabel.clone())),
-                    ],
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-                class_nodes += 1;
+                class_inserts.push(vec![
+                    Value::String(id),
+                    Value::String(iri),
+                    Value::String(label),
+                    Value::String(comment),
+                    Value::String(ns),
+                    Value::String(glabel.clone()),
+                ]);
             }
         }
-        let mut prop_nodes = 0;
+        Self::batch_insert_nodes(
+            &conn,
+            "OntologyClass",
+            &["id", "iri", "label", "comment", "namespace", "graph"],
+            class_inserts,
+        )?;
+        let class_nodes = have_classes
+            .iter()
+            .filter(|id| id.starts_with(&format!("{glabel}\u{1f}")))
+            .count();
+        // NOTE: the graph's projection was cleared first, so every own-graph id above
+        // is one this call inserted.
+        let mut prop_inserts: Vec<Vec<Value>> = Vec::new();
         for (iri, (kind, label, comment)) in &props {
             let id = content_id(&glabel, iri);
             if have_props.insert(id.clone()) {
                 let dts = datatypes.get(iri).cloned().unwrap_or_default();
                 let ns = namespace_of(iri);
-                conn.execute(
-                    &mut mk_prop,
-                    vec![
-                        ("id", Value::String(id)),
-                        ("iri", Value::String(iri.clone())),
-                        ("kind", Value::String(kind.clone())),
-                        ("label", Value::String(label.clone())),
-                        ("comment", Value::String(comment.clone())),
-                        (
-                            "rangeDatatypes",
-                            Value::String(serde_json::to_string(&dts)?),
-                        ),
-                        ("namespace", Value::String(ns)),
-                        ("graph", Value::String(glabel.clone())),
-                    ],
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-                prop_nodes += 1;
+                prop_inserts.push(vec![
+                    Value::String(id),
+                    Value::String(iri.clone()),
+                    Value::String(kind.clone()),
+                    Value::String(label.clone()),
+                    Value::String(comment.clone()),
+                    Value::String(serde_json::to_string(&dts)?),
+                    Value::String(ns),
+                    Value::String(glabel.clone()),
+                ]);
             }
         }
         // Stubs for properties only named by domain/range triples; same cross-graph
@@ -1018,91 +824,85 @@ impl LadybugSchemaStore {
             let dts = datatypes.get(&iri).cloned().unwrap_or_default();
             if have_props.insert(id.clone()) {
                 let ns = namespace_of(&iri);
-                conn.execute(
-                    &mut mk_prop,
-                    vec![
-                        ("id", Value::String(id)),
-                        ("iri", Value::String(iri)),
-                        ("kind", Value::String(String::new())),
-                        ("label", Value::String(String::new())),
-                        ("comment", Value::String(String::new())),
-                        (
-                            "rangeDatatypes",
-                            Value::String(serde_json::to_string(&dts)?),
-                        ),
-                        ("namespace", Value::String(ns)),
-                        ("graph", Value::String(glabel.clone())),
-                    ],
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-                prop_nodes += 1;
+                prop_inserts.push(vec![
+                    Value::String(id),
+                    Value::String(iri),
+                    Value::String(String::new()),
+                    Value::String(String::new()),
+                    Value::String(String::new()),
+                    Value::String(serde_json::to_string(&dts)?),
+                    Value::String(ns),
+                    Value::String(glabel.clone()),
+                ]);
             }
         }
+        Self::batch_insert_nodes(
+            &conn,
+            "OntologyProperty",
+            &[
+                "id",
+                "iri",
+                "kind",
+                "label",
+                "comment",
+                "rangeDatatypes",
+                "namespace",
+                "graph",
+            ],
+            prop_inserts,
+        )?;
+        let prop_nodes = have_props
+            .iter()
+            .filter(|id| id.starts_with(&format!("{glabel}\u{1f}")))
+            .count();
         // Edges resolve to this graph's nodes first, then to any graph's node with the
         // same IRI, so projections that share classes stay connected.
-        let make_edges = |table: &str,
-                          from_table: &str,
-                          to_table: &str,
-                          pairs: &[(String, String)],
-                          from_pool: &std::collections::BTreeSet<String>,
-                          to_pool: &std::collections::BTreeSet<String>|
-         -> Result<usize> {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "MATCH (a:{from_table}) WHERE a.id = $from MATCH (b:{to_table}) WHERE b.id = $to \
-                     CREATE (a)-[:{table}]->(b)"
-                ))
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-            let mut n = 0;
+        let mut edges = 0;
+        for (rel, from_table, to_table, pairs, from_pool, to_pool) in [
+            (
+                "SUBCLASS_OF",
+                "OntologyClass",
+                "OntologyClass",
+                &subclass,
+                &have_classes,
+                &have_classes,
+            ),
+            (
+                "EQUIVALENT_CLASS",
+                "OntologyClass",
+                "OntologyClass",
+                &equiv,
+                &have_classes,
+                &have_classes,
+            ),
+            (
+                "DOMAIN",
+                "OntologyProperty",
+                "OntologyClass",
+                &domain,
+                &have_props,
+                &have_classes,
+            ),
+            (
+                "RANGE",
+                "OntologyProperty",
+                "OntologyClass",
+                &range,
+                &have_props,
+                &have_classes,
+            ),
+        ] {
+            let mut resolved = Vec::new();
             for (a, b) in pairs {
-                let (Some(from), Some(to)) = (
+                if let (Some(from), Some(to)) = (
                     resolve_node(from_pool, &glabel, a),
                     resolve_node(to_pool, &glabel, b),
-                ) else {
-                    continue;
-                };
-                conn.execute(
-                    &mut stmt,
-                    vec![("from", Value::String(from)), ("to", Value::String(to))],
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-                n += 1;
+                ) {
+                    resolved.push((from, to));
+                }
             }
-            Ok(n)
-        };
-        let mut edges = 0;
-        edges += make_edges(
-            "SUBCLASS_OF",
-            "OntologyClass",
-            "OntologyClass",
-            &subclass,
-            &have_classes,
-            &have_classes,
-        )?;
-        edges += make_edges(
-            "EQUIVALENT_CLASS",
-            "OntologyClass",
-            "OntologyClass",
-            &equiv,
-            &have_classes,
-            &have_classes,
-        )?;
-        edges += make_edges(
-            "DOMAIN",
-            "OntologyProperty",
-            "OntologyClass",
-            &domain,
-            &have_props,
-            &have_classes,
-        )?;
-        edges += make_edges(
-            "RANGE",
-            "OntologyProperty",
-            "OntologyClass",
-            &range,
-            &have_props,
-            &have_classes,
-        )?;
+            edges += Self::batch_insert_rels(&conn, rel, from_table, to_table, &resolved)?;
+        }
         Ok((class_nodes, prop_nodes, edges))
     }
 
@@ -1132,29 +932,6 @@ impl LadybugSchemaStore {
                 .unwrap_or_default()
         };
         let conn = self.connection()?;
-        let mut mk_shape = conn
-            .prepare(
-                "CREATE (:ShaclShape {id: $id, shape: $shape, targetClasses: $targetClasses, \
-                 targetNodes: $targetNodes, targetSubjectsOf: $targetSubjectsOf, \
-                 targetObjectsOf: $targetObjectsOf, message: $message, severity: $severity, \
-                 deactivated: $deactivated, namespace: $namespace, graph: $graph})",
-            )
-            .map_err(|e| Error::Ladybug(e.to_string()))?;
-        let mut mk_prop = conn
-            .prepare(
-                "CREATE (:ShaclProperty {id: $id, shapeId: $shapeId, path: $path, datatype: $datatype, \
-                 class: $class, nodeKind: $nodeKind, minCount: $minCount, maxCount: $maxCount, \
-                 pattern: $pattern, minInclusive: $minInclusive, maxInclusive: $maxInclusive, \
-                 message: $message, severity: $severity, deactivated: $deactivated, \
-                 namespace: $namespace, graph: $graph})",
-            )
-            .map_err(|e| Error::Ladybug(e.to_string()))?;
-        let mut mk_has = conn
-            .prepare(
-                "MATCH (s:ShaclShape) WHERE s.id = $shape MATCH (p:ShaclProperty) WHERE p.id = $prop \
-                 CREATE (s)-[:HAS_CONSTRAINT]->(p)",
-            )
-            .map_err(|e| Error::Ladybug(e.to_string()))?;
         let strings = |terms: Vec<&oxrdf::Term>| -> Vec<String> {
             terms.into_iter().filter_map(iri_of).collect()
         };
@@ -1186,6 +963,9 @@ impl LadybugSchemaStore {
         };
         let mut shapes = 0;
         let mut constraints = 0;
+        let mut shape_rows: Vec<Vec<Value>> = Vec::new();
+        let mut constraint_rows: Vec<Vec<Value>> = Vec::new();
+        let mut has_pairs: Vec<(String, String)> = Vec::new();
         let mut keys: Vec<String> = by_subj.keys().cloned().collect();
         keys.sort();
         for key in keys {
@@ -1210,55 +990,30 @@ impl LadybugSchemaStore {
             }
             target_classes.sort();
             target_classes.dedup();
-            conn.execute(
-                &mut mk_shape,
-                vec![
-                    ("id", Value::String(sid.clone())),
-                    ("shape", Value::String(key.clone())),
-                    (
-                        "targetClasses",
-                        Value::String(serde_json::to_string(&target_classes)?),
-                    ),
-                    (
-                        "targetNodes",
-                        Value::String(serde_json::to_string(
-                            &objs(&key, &sh("targetNode"))
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>(),
-                        )?),
-                    ),
-                    (
-                        "targetSubjectsOf",
-                        Value::String(serde_json::to_string(&strings(objs(
-                            &key,
-                            &sh("targetSubjectsOf"),
-                        )))?),
-                    ),
-                    (
-                        "targetObjectsOf",
-                        Value::String(serde_json::to_string(&strings(objs(
-                            &key,
-                            &sh("targetObjectsOf"),
-                        )))?),
-                    ),
-                    (
-                        "message",
-                        Value::String(first_literal(objs(&key, &sh("message")))),
-                    ),
-                    (
-                        "severity",
-                        Value::String(first_iri(objs(&key, &sh("severity")))),
-                    ),
-                    (
-                        "deactivated",
-                        Value::Bool(is_true(objs(&key, &sh("deactivated")))),
-                    ),
-                    ("namespace", Value::String(namespace_of(bare_iri(&key)))),
-                    ("graph", Value::String(glabel.clone())),
-                ],
-            )
-            .map_err(|e| Error::Ladybug(e.to_string()))?;
+            shape_rows.push(vec![
+                Value::String(sid.clone()),
+                Value::String(key.clone()),
+                Value::String(serde_json::to_string(&target_classes)?),
+                Value::String(serde_json::to_string(
+                    &objs(&key, &sh("targetNode"))
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                )?),
+                Value::String(serde_json::to_string(&strings(objs(
+                    &key,
+                    &sh("targetSubjectsOf"),
+                )))?),
+                Value::String(serde_json::to_string(&strings(objs(
+                    &key,
+                    &sh("targetObjectsOf"),
+                )))?),
+                Value::String(first_literal(objs(&key, &sh("message")))),
+                Value::String(first_iri(objs(&key, &sh("severity")))),
+                Value::Bool(is_true(objs(&key, &sh("deactivated")))),
+                Value::String(namespace_of(bare_iri(&key))),
+                Value::String(glabel.clone()),
+            ]);
             let prop_terms: Vec<String> = objs(&key, &sh("property"))
                 .into_iter()
                 .map(ToString::to_string)
@@ -1286,62 +1041,75 @@ impl LadybugSchemaStore {
                             .unwrap_or_else(|| pkey.clone());
                     }
                 }
-                conn.execute(
-                    &mut mk_prop,
-                    vec![
-                        ("id", Value::String(cid.clone())),
-                        ("shapeId", Value::String(sid.clone())),
-                        ("path", Value::String(path.clone())),
-                        (
-                            "datatype",
-                            Value::String(first_iri(objs(pkey, &sh("datatype")))),
-                        ),
-                        ("class", Value::String(first_iri(objs(pkey, &sh("class"))))),
-                        (
-                            "nodeKind",
-                            Value::String(first_iri(objs(pkey, &sh("nodeKind")))),
-                        ),
-                        ("minCount", opt_int(first_int(objs(pkey, &sh("minCount"))))),
-                        ("maxCount", opt_int(first_int(objs(pkey, &sh("maxCount"))))),
-                        (
-                            "pattern",
-                            Value::String(first_literal(objs(pkey, &sh("pattern")))),
-                        ),
-                        (
-                            "minInclusive",
-                            Value::String(first_literal(objs(pkey, &sh("minInclusive")))),
-                        ),
-                        (
-                            "maxInclusive",
-                            Value::String(first_literal(objs(pkey, &sh("maxInclusive")))),
-                        ),
-                        (
-                            "message",
-                            Value::String(first_literal(objs(pkey, &sh("message")))),
-                        ),
-                        (
-                            "severity",
-                            Value::String(first_iri(objs(pkey, &sh("severity")))),
-                        ),
-                        (
-                            "deactivated",
-                            Value::Bool(is_true(objs(pkey, &sh("deactivated")))),
-                        ),
-                        ("namespace", Value::String(namespace_of(bare_iri(&path)))),
-                        ("graph", Value::String(glabel.clone())),
-                    ],
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
-                conn.execute(
-                    &mut mk_has,
-                    vec![
-                        ("shape", Value::String(sid.clone())),
-                        ("prop", Value::String(cid)),
-                    ],
-                )
-                .map_err(|e| Error::Ladybug(e.to_string()))?;
+                constraint_rows.push(vec![
+                    Value::String(cid.clone()),
+                    Value::String(sid.clone()),
+                    Value::String(path.clone()),
+                    Value::String(first_iri(objs(pkey, &sh("datatype")))),
+                    Value::String(first_iri(objs(pkey, &sh("class")))),
+                    Value::String(first_iri(objs(pkey, &sh("nodeKind")))),
+                    opt_int(first_int(objs(pkey, &sh("minCount")))),
+                    opt_int(first_int(objs(pkey, &sh("maxCount")))),
+                    Value::String(first_literal(objs(pkey, &sh("pattern")))),
+                    Value::String(first_literal(objs(pkey, &sh("minInclusive")))),
+                    Value::String(first_literal(objs(pkey, &sh("maxInclusive")))),
+                    Value::String(first_literal(objs(pkey, &sh("message")))),
+                    Value::String(first_iri(objs(pkey, &sh("severity")))),
+                    Value::Bool(is_true(objs(pkey, &sh("deactivated")))),
+                    Value::String(namespace_of(bare_iri(&path))),
+                    Value::String(glabel.clone()),
+                ]);
+                has_pairs.push((sid.clone(), cid));
             }
         }
+        Self::batch_insert_nodes(
+            &conn,
+            "ShaclShape",
+            &[
+                "id",
+                "shape",
+                "targetClasses",
+                "targetNodes",
+                "targetSubjectsOf",
+                "targetObjectsOf",
+                "message",
+                "severity",
+                "deactivated",
+                "namespace",
+                "graph",
+            ],
+            shape_rows,
+        )?;
+        Self::batch_insert_nodes(
+            &conn,
+            "ShaclProperty",
+            &[
+                "id",
+                "shapeId",
+                "path",
+                "datatype",
+                "class",
+                "nodeKind",
+                "minCount",
+                "maxCount",
+                "pattern",
+                "minInclusive",
+                "maxInclusive",
+                "message",
+                "severity",
+                "deactivated",
+                "namespace",
+                "graph",
+            ],
+            constraint_rows,
+        )?;
+        Self::batch_insert_rels(
+            &conn,
+            "HAS_CONSTRAINT",
+            "ShaclShape",
+            "ShaclProperty",
+            &has_pairs,
+        )?;
         Ok((shapes, constraints))
     }
 
@@ -1529,9 +1297,10 @@ impl LadybugSchemaStore {
         Ok(())
     }
 
-    /// Rebuilds the `Namespace` inventory from the projected content: one node per
-    /// namespace with its term count and source graphs. Existing prefixes stick;
-    /// brand-new namespaces get derived ones. Returns the number of namespaces.
+    /// Rebuilds the `Namespace` inventory from the projected content and the triple
+    /// rows: one node per namespace with its term and triple counts and source graphs.
+    /// Existing prefixes stick; brand-new namespaces get derived ones. Returns the
+    /// number of namespaces.
     pub fn refresh_namespaces(&self) -> Result<usize> {
         self.backfill_namespaces()?;
         let mut prefixes: std::collections::BTreeMap<String, String> =
@@ -1543,6 +1312,8 @@ impl LadybugSchemaStore {
         }
         let mut taken: std::collections::BTreeSet<String> = prefixes.values().cloned().collect();
         let mut terms: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
+            std::collections::BTreeMap::new();
+        let mut triple_counts: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
             std::collections::BTreeMap::new();
         for table in [
             "OntologyClass",
@@ -1561,40 +1332,75 @@ impl LadybugSchemaStore {
                 e.1.insert(row[1].clone());
             }
         }
+        for row in self.cypher(
+            "MATCH ()-[r:Statement]->() WHERE NOT r.namespace = '' RETURN r.namespace, r.graph",
+        )? {
+            if row.len() < 2 || row[0].is_empty() {
+                continue;
+            }
+            let e = triple_counts
+                .entry(row[0].clone())
+                .or_insert((0, BTreeSet::new()));
+            e.0 += 1;
+            e.1.insert(row[1].clone());
+        }
         let conn = self.connection()?;
         conn.query("MATCH (n:Namespace) DETACH DELETE n")
             .map_err(|e| Error::Ladybug(e.to_string()))?;
         let mut mk = conn
             .prepare(
-                "CREATE (:Namespace {iri: $iri, prefix: $prefix, sourceGraphs: $graphs, termCount: $count})",
+                "CREATE (:Namespace {iri: $iri, prefix: $prefix, sourceGraphs: $graphs, termCount: $count, triples: $triples})",
             )
             .map_err(|e| Error::Ladybug(e.to_string()))?;
-        for (iri, (count, graphs)) in &terms {
+        let mut iris: BTreeSet<String> = terms.keys().cloned().collect();
+        iris.extend(triple_counts.keys().cloned());
+        for iri in &iris {
             let prefix = prefixes
                 .get(iri)
                 .cloned()
                 .unwrap_or_else(|| auto_prefix(iri, &mut taken));
             taken.insert(prefix.clone());
-            let graphs: Vec<String> = graphs.iter().cloned().collect();
+            let mut graphs: BTreeSet<String> = BTreeSet::new();
+            let mut count = 0;
+            let mut triples = 0;
+            if let Some((c, g)) = terms.get(iri) {
+                count = *c;
+                graphs.extend(g.iter().cloned());
+            }
+            if let Some((c, g)) = triple_counts.get(iri) {
+                triples = *c;
+                graphs.extend(g.iter().cloned());
+            }
+            // Graph tokens are `<iri>`/`_:label`/`DEFAULT`; inventory shows plain IRIs.
+            let graphs: Vec<String> = graphs
+                .into_iter()
+                .map(|g| {
+                    g.strip_prefix('<')
+                        .and_then(|s| s.strip_suffix('>'))
+                        .unwrap_or(&g)
+                        .to_owned()
+                })
+                .collect();
             conn.execute(
                 &mut mk,
                 vec![
                     ("iri", Value::String(iri.clone())),
                     ("prefix", Value::String(prefix)),
                     ("graphs", Value::String(serde_json::to_string(&graphs)?)),
-                    ("count", Value::Int64(*count as i64)),
+                    ("count", Value::Int64(count as i64)),
+                    ("triples", Value::Int64(triples as i64)),
                 ],
             )
             .map_err(|e| Error::Ladybug(e.to_string()))?;
         }
-        Ok(terms.len())
+        Ok(iris.len())
     }
 
     /// Every namespace, ordered by prefix.
     pub fn list_namespaces(&self) -> Result<Vec<NamespaceInfo>> {
         let mut out = Vec::new();
         for row in
-            self.cypher("MATCH (n:Namespace) RETURN n.iri, n.prefix, n.sourceGraphs, n.termCount ORDER BY n.prefix")?
+            self.cypher("MATCH (n:Namespace) RETURN n.iri, n.prefix, n.sourceGraphs, n.termCount, n.triples ORDER BY n.prefix")?
         {
             if row.len() < 4 {
                 continue;
@@ -1605,9 +1411,394 @@ impl LadybugSchemaStore {
                 prefix: row[1].clone(),
                 graphs,
                 terms: row[3].parse().unwrap_or(0),
+                triples: row.get(4).and_then(|v| v.parse().ok()).unwrap_or(0),
             });
         }
         Ok(out)
+    }
+
+    /// Bulk node insert: one multi-`CREATE` with numbered parameters per chunk instead of
+    /// one transaction per row (orders of magnitude faster on large documents). Each inner
+    /// vec holds the column values in `cols` order.
+    fn batch_insert_nodes(
+        conn: &Connection<'_>,
+        table: &str,
+        cols: &[&str],
+        rows: Vec<Vec<Value>>,
+    ) -> Result<()> {
+        const BATCH: usize = 500;
+        for chunk in rows.chunks(BATCH) {
+            let mut owned: Vec<(String, Value)> = Vec::new();
+            let mut patterns = Vec::new();
+            for (i, row) in chunk.iter().enumerate() {
+                debug_assert_eq!(row.len(), cols.len());
+                let mut assigns = Vec::new();
+                for (j, col) in cols.iter().enumerate() {
+                    let name = format!("p{i}_{j}");
+                    assigns.push(format!("{col}: ${name}"));
+                    owned.push((name, row[j].clone()));
+                }
+                patterns.push(format!("(:{table} {{{}}})", assigns.join(", ")));
+            }
+            let mut stmt = conn
+                .prepare(&format!("CREATE {}", patterns.join(", ")))
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            conn.execute(
+                &mut stmt,
+                owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect(),
+            )
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Bulk relationship insert between known node ids via `UNWIND` over parallel id
+    /// lists (Ladybug list extraction is 1-based). Returns relationships created.
+    fn batch_insert_rels(
+        conn: &Connection<'_>,
+        rel: &str,
+        from_table: &str,
+        to_table: &str,
+        pairs: &[(String, String)],
+    ) -> Result<usize> {
+        const BATCH: usize = 500;
+        let mut n = 0;
+        for chunk in pairs.chunks(BATCH) {
+            let from: Vec<Value> = chunk
+                .iter()
+                .map(|(a, _)| Value::String(a.clone()))
+                .collect();
+            let to: Vec<Value> = chunk
+                .iter()
+                .map(|(_, b)| Value::String(b.clone()))
+                .collect();
+            let m = chunk.len();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "UNWIND range(1, {m}) AS i MATCH (a:{from_table}) WHERE a.id = $from[i] \
+                 MATCH (b:{to_table}) WHERE b.id = $to[i] CREATE (a)-[:{rel}]->(b)"
+                ))
+                .map_err(|e| Error::Ladybug(e.to_string()))?;
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("from", Value::List(LogicalType::String, from)),
+                    ("to", Value::List(LogicalType::String, to)),
+                ],
+            )
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+            n += chunk.len();
+        }
+        Ok(n)
+    }
+    fn write_copy_csv(header: &[&str], rows: &[Vec<String>]) -> Result<PathBuf> {
+        fn esc(s: &str) -> String {
+            let mut o = String::with_capacity(s.len() + 2);
+            o.push('"');
+            for c in s.chars() {
+                if c == '"' {
+                    o.push('"');
+                }
+                o.push(c);
+            }
+            o.push('"');
+            o
+        }
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ontobug-copy-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| Error::Ladybug(e.to_string()))?;
+        let mut text = String::new();
+        text.push_str(&header.iter().map(|h| esc(h)).collect::<Vec<_>>().join(","));
+        text.push('\n');
+        for r in rows {
+            text.push_str(&r.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
+            text.push('\n');
+        }
+        let path = dir.join("copy.csv");
+        std::fs::write(&path, text).map_err(|e| Error::Ladybug(e.to_string()))?;
+        Ok(path)
+    }
+
+    /// One native `COPY` of CSV rows into a table (skipped when empty). Quoted
+    /// newlines need a single-threaded read.
+    fn copy_csv(
+        conn: &Connection<'_>,
+        table: &str,
+        header: &[&str],
+        rows: &[Vec<String>],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let path = Self::write_copy_csv(header, rows)?;
+        let r = conn.query(&format!(
+            "COPY {table} FROM '{}' (HEADER true, PARALLEL=FALSE)",
+            path.display()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().expect("file has a parent"));
+        r.map_err(|e| Error::Ladybug(e.to_string()))?;
+        Ok(())
+    }
+
+    /// A term as an `RdfNode` row: id (the N-Triples token), kind, bare value,
+    /// datatype/lang (literals) and namespace.
+    fn node_row(term: &oxrdf::Term) -> (String, Vec<String>) {
+        match term {
+            oxrdf::Term::NamedNode(n) => {
+                let iri = n.as_str().to_owned();
+                (
+                    format!("<{iri}>"),
+                    vec![
+                        format!("<{iri}>"),
+                        "iri".to_owned(),
+                        iri.clone(),
+                        String::new(),
+                        String::new(),
+                        namespace_of(&iri),
+                    ],
+                )
+            }
+            oxrdf::Term::BlankNode(b) => {
+                let label = b.as_str().to_owned();
+                (
+                    format!("_:{label}"),
+                    vec![
+                        format!("_:{label}"),
+                        "blank".to_owned(),
+                        label,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ],
+                )
+            }
+            oxrdf::Term::Literal(l) => {
+                let id = l.to_string();
+                (
+                    id,
+                    vec![
+                        l.to_string(),
+                        "literal".to_owned(),
+                        l.value().to_owned(),
+                        l.datatype().as_str().to_owned(),
+                        l.language().unwrap_or_default().to_owned(),
+                        String::new(),
+                    ],
+                )
+            }
+            oxrdf::Term::Triple(t) => {
+                let id = t.to_string();
+                (
+                    id,
+                    vec![
+                        t.to_string(),
+                        "triple".to_owned(),
+                        t.to_string(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ],
+                )
+            }
+        }
+    }
+
+    /// Ingests triples as nodes and edges: distinct terms become `RdfNode` rows
+    /// (deduplicated against the store), one `Statement` rel per distinct triple
+    /// (deduplicated within the batch and against the affected graphs). Both go in
+    /// with one native `COPY` per table. Returns statements inserted.
+    pub fn ingest_quads(&self, items: &[(String, oxrdf::Triple)]) -> Result<usize> {
+        // Distinct triples first (RDF is a set).
+        let mut seen = BTreeSet::new();
+        let mut triples: Vec<(String, oxrdf::Triple)> = Vec::new();
+        for (graph, t) in items {
+            let key = (
+                graph.clone(),
+                t.subject.to_string(),
+                t.predicate.to_string(),
+                t.object.to_string(),
+            );
+            if seen.insert(key) {
+                triples.push((graph.clone(), t.clone()));
+            }
+        }
+        if triples.is_empty() {
+            return Ok(0);
+        }
+        // Nodes, deduplicated against the store.
+        let mut have: BTreeSet<String> = self
+            .cypher("MATCH (n:RdfNode) RETURN n.id")?
+            .into_iter()
+            .filter_map(|r| r.into_iter().next())
+            .collect();
+        let mut node_rows: Vec<Vec<String>> = Vec::new();
+        // (from-id, to-id, predicate, graph, namespace) per statement, in order.
+        let mut rel_keys: Vec<(String, String, String, String, String)> = Vec::new();
+        for (graph, t) in &triples {
+            let (sid, srow) = Self::node_row(&t.subject.clone().into());
+            let (oid, orow) = Self::node_row(&t.object);
+            if have.insert(sid.clone()) {
+                node_rows.push(srow);
+            }
+            if have.insert(oid.clone()) {
+                node_rows.push(orow);
+            }
+            let pred = t.predicate.as_str().to_owned();
+            let ns = match &t.subject {
+                oxrdf::NamedOrBlankNode::NamedNode(n) => namespace_of(n.as_str()),
+                _ => String::new(),
+            };
+            rel_keys.push((sid, oid, pred, graph.clone(), ns));
+        }
+        // Ordinals continue per graph after existing statements.
+        let graphs: BTreeSet<String> = rel_keys.iter().map(|(_, _, _, g, _)| g.clone()).collect();
+        let mut next: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for g in &graphs {
+            let max: i64 = self
+                .cypher_params(
+                    "MATCH ()-[r:Statement]->() WHERE r.graph = $graph RETURN max(r.ord)",
+                    vec![("graph", Value::String(g.clone()))],
+                )?
+                .first()
+                .and_then(|r| r.first())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(-1);
+            next.insert(g.clone(), max + 1);
+        }
+        // Existing statements of the affected graphs, to keep set semantics.
+        let mut have_rels = BTreeSet::new();
+        for g in &graphs {
+            for row in self.cypher_params(
+                "MATCH (a:RdfNode)-[r:Statement]->(b:RdfNode) WHERE r.graph = $graph \
+                 RETURN a.id, r.predicate, b.id",
+                vec![("graph", Value::String(g.clone()))],
+            )? {
+                if row.len() == 3 {
+                    have_rels.insert((row[0].clone(), row[1].clone(), row[2].clone()));
+                }
+            }
+        }
+        let conn = self.connection()?;
+        Self::copy_csv(
+            &conn,
+            "RdfNode",
+            &["id", "kind", "value", "datatype", "lang", "namespace"],
+            &node_rows,
+        )?;
+        let mut rel_rows: Vec<Vec<String>> = Vec::new();
+        for (from, to, pred, graph, ns) in rel_keys {
+            if !have_rels.insert((from.clone(), pred.clone(), to.clone())) {
+                continue;
+            }
+            let ord = next.entry(graph.clone()).or_insert(0);
+            rel_rows.push(vec![from, to, pred, graph, ns, ord.to_string()]);
+            *ord += 1;
+        }
+        Self::copy_csv(
+            &conn,
+            "Statement",
+            &["FROM", "TO", "predicate", "graph", "namespace", "ord"],
+            &rel_rows,
+        )?;
+        Ok(rel_rows.len())
+    }
+
+    /// Deletes every statement of a graph (by graph token, see [`graph_token`]), then
+    /// the nodes orphaned by it (terms used only by that graph).
+    pub fn delete_graph_triples(&self, graph: &str) -> Result<()> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare("MATCH ()-[r:Statement]->() WHERE r.graph = $graph DELETE r")
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        conn.execute(&mut stmt, vec![("graph", Value::String(graph.to_owned()))])
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        conn.query("MATCH (n:RdfNode) WHERE NOT (n)--() DELETE n")
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        Ok(())
+    }
+
+    /// A row of a statement join: subject and object ids (N-Triples tokens), the bare
+    /// predicate IRI, the object node's value (the literal lexicon, if literal) and
+    /// the statement namespace.
+    fn statement_rows(&self, where_graph: Option<&str>) -> Result<Vec<Vec<String>>> {
+        let (filter, params) = match where_graph {
+            Some(g) => (
+                "WHERE r.graph = $graph ".to_owned(),
+                vec![("graph", Value::String(g.to_owned()))],
+            ),
+            None => (String::new(), Vec::new()),
+        };
+        let order = match where_graph {
+            Some(_) => "ORDER BY r.ord",
+            None => "ORDER BY r.graph, r.ord",
+        };
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "MATCH (a:RdfNode)-[r:Statement]->(b:RdfNode) {filter}RETURN a.id, r.predicate, b.id, b.value, r.namespace, r.graph {order}"
+            ))
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        let result = conn
+            .execute(&mut stmt, params)
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
+        Ok(result
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .collect())
+    }
+
+    /// The triples of a graph in document order.
+    pub fn read_triples(&self, graph: &str) -> Result<Vec<TripleRow>> {
+        let mut out = Vec::new();
+        for row in self.statement_rows(Some(graph))? {
+            if row.len() < 6 {
+                continue;
+            }
+            out.push(TripleRow {
+                graph: graph.to_owned(),
+                subject: row[0].clone(),
+                predicate: format!("<{}>", row[1]),
+                object: row[2].clone(),
+                lex: row[3].clone(),
+                namespace: row[4].clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every triple, ordered by graph then document order.
+    pub fn read_all_triples_ordered(&self) -> Result<Vec<TripleRow>> {
+        let mut out = Vec::new();
+        for row in self.statement_rows(None)? {
+            if row.len() < 6 {
+                continue;
+            }
+            out.push(TripleRow {
+                subject: row[0].clone(),
+                predicate: format!("<{}>", row[1]),
+                object: row[2].clone(),
+                lex: row[3].clone(),
+                namespace: row[4].clone(),
+                graph: row[5].clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The number of statements, overall or for one graph token.
+    pub fn count_triples(&self, graph: Option<&str>) -> Result<usize> {
+        let rows = match graph {
+            Some(g) => self.cypher_params(
+                "MATCH ()-[r:Statement]->() WHERE r.graph = $graph RETURN count(r)",
+                vec![("graph", Value::String(g.to_owned()))],
+            )?,
+            None => self.cypher("MATCH ()-[r:Statement]->() RETURN count(r)")?,
+        };
+        Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
     }
 }
 
@@ -1616,40 +1807,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrates_pre_namespace_databases() {
+    fn open_migrates_pre_namespace_tables() {
         let store = LadybugSchemaStore::open_in_memory().unwrap();
-        // Downgrade to the legacy schema: drop the new tables, recreate them without
-        // the `namespace` column, and fill them the old way.
+        // Downgrade to the legacy schema: drop rels, then nodes, and recreate the
+        // node tables without the `namespace` column; then fill them the old way.
         let conn = store.connection().unwrap();
-        for (rel, _, _) in CONTENT_RELS {
+        for rel in [
+            "SUBCLASS_OF",
+            "EQUIVALENT_CLASS",
+            "DOMAIN",
+            "RANGE",
+            "HAS_CONSTRAINT",
+            "TARGETS",
+            "ON_PROPERTY",
+        ] {
             conn.query(&format!("DROP TABLE {rel}")).unwrap();
         }
-        for (table, cols) in LEGACY_NODE_COLS {
-            conn.query(&format!("DROP TABLE {table}")).unwrap();
-            let defs = cols
-                .iter()
-                .map(|c| {
-                    if *c == "id" {
-                        format!("{c} STRING PRIMARY KEY")
-                    } else if is_int_col(c) {
-                        format!("{c} INT64")
-                    } else if is_bool_col(c) {
-                        format!("{c} BOOLEAN")
-                    } else {
-                        format!("{c} STRING")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            conn.query(&format!("CREATE NODE TABLE {table}({defs})"))
-                .unwrap();
-        }
-        for ddl in [
-            "CREATE REL TABLE SUBCLASS_OF(FROM OntologyClass TO OntologyClass)",
-            "CREATE REL TABLE HAS_CONSTRAINT(FROM ShaclShape TO ShaclProperty)",
-            "CREATE REL TABLE TARGETS(FROM ShaclShape TO OntologyClass)",
+        for table in [
+            "OntologyClass",
+            "OntologyProperty",
+            "ShaclShape",
+            "ShaclProperty",
         ] {
-            conn.query(ddl).unwrap();
+            conn.query(&format!("DROP TABLE {table}")).unwrap();
+        }
+        for (table, cols) in [
+            (
+                "OntologyClass",
+                vec![
+                    "id STRING PRIMARY KEY",
+                    "iri STRING",
+                    "label STRING",
+                    "comment STRING",
+                    "graph STRING",
+                ],
+            ),
+            (
+                "OntologyProperty",
+                vec![
+                    "id STRING PRIMARY KEY",
+                    "iri STRING",
+                    "kind STRING",
+                    "label STRING",
+                    "comment STRING",
+                    "rangeDatatypes STRING",
+                    "graph STRING",
+                ],
+            ),
+        ] {
+            conn.query(&format!("CREATE NODE TABLE {table}({})", cols.join(", ")))
+                .unwrap();
         }
         store
             .cypher("CREATE (:OntologyClass {id: 'g\u{1f}http://ex.org/C1', iri: 'http://ex.org/C1', label: '', comment: '', graph: 'g'})")
@@ -1658,56 +1865,33 @@ mod tests {
             .cypher("CREATE (:OntologyClass {id: 'g\u{1f}http://ex.org/C2', iri: 'http://ex.org/C2', label: '', comment: '', graph: 'g'})")
             .unwrap();
         store
-            .cypher("MATCH (a:OntologyClass), (b:OntologyClass) WHERE a.iri = 'http://ex.org/C1' AND b.iri = 'http://ex.org/C2' CREATE (a)-[:SUBCLASS_OF]->(b)")
+            .cypher("CREATE (:OntologyProperty {id: 'g\u{1f}http://ex.org/p', iri: 'http://ex.org/p', kind: 'object', label: '', comment: '', rangeDatatypes: '[]', graph: 'g'})")
             .unwrap();
-        // minCount omitted: NULL must survive the migration.
-        store
-            .cypher("CREATE (:ShaclShape {id: 'g\u{1f}<http://ex.org/S>', shape: '<http://ex.org/S>', targetClasses: '[\"http://ex.org/C2\"]', targetNodes: '[]', targetSubjectsOf: '[]', targetObjectsOf: '[]', message: '', severity: '', deactivated: false, graph: 'g'})")
-            .unwrap();
-        store
-            .cypher("CREATE (:ShaclProperty {id: 'c', shapeId: 's', path: 'http://ex.org/p', datatype: '', class: '', nodeKind: '', pattern: '', minInclusive: '', maxInclusive: '', message: '', severity: '', deactivated: false, graph: 'g'})")
-            .unwrap();
-        store
-            .cypher("MATCH (s:ShaclShape), (p:ShaclProperty) CREATE (s)-[:HAS_CONSTRAINT]->(p)")
-            .unwrap();
-        store
-            .cypher("MATCH (s:ShaclShape), (c:OntologyClass) WHERE c.iri = 'http://ex.org/C2' CREATE (s)-[:TARGETS]->(c)")
-            .unwrap();
-        assert!(!store.table_has_column("OntologyClass", "namespace"));
-        store.maybe_migrate_content_schema().unwrap();
-        assert!(store.table_has_column("OntologyClass", "namespace"));
-        // Rows, edges and NULLs preserved; namespaces derived and inventoried.
+        // Reopening (ensure) must ALTER the tables, backfill namespaces, and refresh
+        // the inventory — without touching existing rows.
+        store.ensure_table().unwrap();
         assert_eq!(
             store
-                .cypher("MATCH (c:OntologyClass) RETURN count(c)")
+                .cypher("MATCH (c:OntologyClass) RETURN c.iri, c.namespace ORDER BY c.iri")
                 .unwrap(),
-            vec![vec!["2".to_owned()]]
+            vec![
+                vec!["http://ex.org/C1".to_owned(), "http://ex.org/".to_owned()],
+                vec!["http://ex.org/C2".to_owned(), "http://ex.org/".to_owned()],
+            ]
         );
         assert_eq!(
             store
-                .cypher("MATCH ()-[r:SUBCLASS_OF]->() RETURN count(r)")
+                .cypher("MATCH (p:OntologyProperty) RETURN p.namespace")
                 .unwrap(),
-            vec![vec!["1".to_owned()]]
-        );
-        assert_eq!(
-            store
-                .cypher("MATCH ()-[r:HAS_CONSTRAINT]->() RETURN count(r)")
-                .unwrap(),
-            vec![vec!["1".to_owned()]]
-        );
-        assert_eq!(
-            store
-                .cypher("MATCH (p:ShaclProperty) RETURN p.minCount")
-                .unwrap(),
-            vec![vec![String::new()]]
+            vec![vec!["http://ex.org/".to_owned()]]
         );
         let ns = store.list_namespaces().unwrap();
         assert_eq!(ns.len(), 1);
         assert_eq!(ns[0].iri, "http://ex.org/");
         assert_eq!(ns[0].prefix, "ex");
-        assert_eq!(ns[0].terms, 4);
+        assert_eq!(ns[0].terms, 3);
         // Second run is a no-op.
-        store.maybe_migrate_content_schema().unwrap();
+        store.ensure_table().unwrap();
         assert_eq!(store.list_namespaces().unwrap().len(), 1);
     }
 
@@ -1739,6 +1923,50 @@ mod tests {
         e.imports = vec![NamedNode::new("https://ex.org/base").unwrap()];
         e.loaded_at = Some("2026-01-01T00:00:00Z".into());
         e
+    }
+
+    #[test]
+    fn triples_live_as_nodes_and_edges() {
+        use oxrdf::{Literal, NamedNode};
+        let store = LadybugSchemaStore::open_in_memory().unwrap();
+        let g = "<https://ex.org/g>".to_owned();
+        let alice = oxrdf::Triple {
+            subject: NamedNode::new("https://example.org/people/alice")
+                .unwrap()
+                .into(),
+            predicate: NamedNode::new("http://schema.org/email").unwrap(),
+            object: Literal::new_simple_literal("a\"l\nice@ex.example").into(),
+        };
+        let n = store
+            .ingest_quads(&[(g.clone(), alice.clone()), (g.clone(), alice.clone())])
+            .unwrap();
+        // The duplicate triple ingests once: RDF is a set.
+        assert_eq!(n, 1);
+        assert_eq!(store.count_triples(Some(&g)).unwrap(), 1);
+        assert_eq!(store.count_triples(None).unwrap(), 1);
+        // Subject and literal object are nodes; the predicate is a rel.
+        assert_eq!(
+            store
+                .cypher("MATCH (n:RdfNode) RETURN n.kind ORDER BY n.kind")
+                .unwrap(),
+            vec![vec!["iri".to_owned()], vec!["literal".to_owned()]]
+        );
+        let rows = store.read_triples(&g).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "<https://example.org/people/alice>");
+        assert_eq!(rows[0].predicate, "<http://schema.org/email>");
+        assert_eq!(rows[0].object, "\"a\\\"l\\nice@ex.example\"");
+        assert_eq!(rows[0].lex, "a\"l\nice@ex.example");
+        assert_eq!(rows[0].namespace, "https://example.org/people/");
+        // Appending the same triples again inserts nothing.
+        assert_eq!(store.ingest_quads(&[(g.clone(), alice)]).unwrap(), 0);
+        // Deleting the graph removes its rels and orphans its nodes.
+        store.delete_graph_triples(&g).unwrap();
+        assert_eq!(store.count_triples(None).unwrap(), 0);
+        assert_eq!(
+            store.cypher("MATCH (n:RdfNode) RETURN count(n)").unwrap(),
+            vec![vec!["0".to_owned()]]
+        );
     }
 
     #[test]

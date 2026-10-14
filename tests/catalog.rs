@@ -284,7 +284,12 @@ fn dataset_round_trips_through_trig_and_lbdb() {
     // Content round-trips through TriG; the registry round-trips through Ladybug.
     let back = Catalog::open(&data, &registry).unwrap();
     assert_eq!(back.list().unwrap(), c.list().unwrap());
-    assert_eq!(back.store().len().unwrap(), c.store().len().unwrap());
+    assert_eq!(
+        back.cypher("MATCH ()-[r:Statement]->() RETURN count(r)")
+            .unwrap(),
+        c.cypher("MATCH ()-[r:Statement]->() RETURN count(r)")
+            .unwrap()
+    );
     // N-Triples dumps are unordered, so compare sorted lines.
     let sorted = |s: String| {
         let mut lines: Vec<_> = s.lines().map(str::to_owned).collect();

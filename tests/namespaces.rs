@@ -47,6 +47,18 @@ fn prefixes(c: &Catalog) -> Vec<(String, String, usize)> {
     out
 }
 
+/// (terms, triples) per namespace, keyed by prefix.
+fn namespace_stats(c: &Catalog) -> Vec<(String, usize, usize)> {
+    let mut out: Vec<(String, usize, usize)> = c
+        .namespaces()
+        .unwrap()
+        .into_iter()
+        .map(|n| (n.prefix, n.terms, n.triples))
+        .collect();
+    out.sort();
+    out
+}
+
 #[test]
 fn namespaces_partition_the_content() {
     let c = catalog();
@@ -74,6 +86,24 @@ fn namespaces_partition_the_content() {
         .parse()
         .unwrap();
     assert_eq!(scoped, 3);
+    // Triple rows are inventoried too, and account for every stored triple with a
+    // named subject (blank-subject triples, like the `[...]` property shapes, have
+    // no namespace).
+    let stats = namespace_stats(&c);
+    let total: usize = stats.iter().map(|(_, _, t)| t).sum();
+    let stored: usize = c
+        .cypher("MATCH ()-[r:Statement]->() RETURN count(r)")
+        .unwrap()[0][0]
+        .parse()
+        .unwrap();
+    let blank: usize = c
+        .cypher("MATCH (a:RdfNode)-[r:Statement]->() WHERE a.kind = 'blank' RETURN count(r)")
+        .unwrap()[0][0]
+        .parse()
+        .unwrap();
+    assert!(blank > 0);
+    assert_eq!(total + blank, stored);
+    assert!(stats.iter().all(|(_, _, t)| *t > 0));
 }
 
 #[test]

@@ -27,9 +27,10 @@
 //! # Ok::<_, Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! RDF content lives in TriG/N-Quads files; the schema registry lives in a Ladybug
-//! database (`.lbdb`) and speaks Cypher. There is no SPARQL surface and no oxilite
-//! compatibility layer.
+//! Ladybug is the database: every triple lives there losslessly, alongside the
+//! registry and the projected schemas, all speaking Cypher. TriG/N-Quads files are
+//! snapshots — [`Catalog::save`] writes one, [`Catalog::open`] seeds an empty registry
+//! from one. There is no SPARQL surface and no oxilite compatibility layer.
 
 mod catalog;
 mod error;
@@ -42,7 +43,7 @@ pub use catalog::{
     Drift, ValidateOptions, Validation,
 };
 pub use error::{Error, Result};
-pub use ladybug::{LadybugSchemaStore, NamespaceInfo, Projected};
+pub use ladybug::{LadybugSchemaStore, NamespaceInfo, Projected, TripleRow};
 pub use registry::{SchemaGraph, SchemaRole};
 pub use validate::{Finding, Mode, Report, ShexResult};
 

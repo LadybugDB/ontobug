@@ -7,12 +7,6 @@ pub enum Error {
     Iri(#[from] oxrdf::IriParseError),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("RDF syntax: {0}")]
-    Load(#[from] oxigraph::store::LoaderError),
-    #[error("RDF serialization: {0}")]
-    Serialize(#[from] oxigraph::store::SerializerError),
-    #[error("storage: {0}")]
-    Storage(#[from] oxigraph::store::StorageError),
     #[error("invalid shapes: {0}")]
     Shapes(String),
     #[error("validation failed: {0}")]
