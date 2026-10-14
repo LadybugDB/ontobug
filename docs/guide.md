@@ -18,7 +18,7 @@ Every example below is runnable: the files are in [`examples/hr`](../examples/hr
 - [12. Cypher recipes](#12-cypher-recipes)
 - [13. Using another SHACL processor](#13-using-another-shacl-processor)
 - [14. Rust API](#14-rust-api)
-- [15. Registry schema reference](#15-registry-schema-reference)
+- [15. Database tour: tables and traversal](#15-database-tour-tables-and-traversal)
 - [16. Compatibility and limits](#16-compatibility-and-limits)
 
 ---
@@ -68,7 +68,7 @@ git clone <this repo> ontobug && cd ontobug
 cargo install --path .          # installs the `ontobug` binary
 ```
 
-Every command works on one dataset, and the dataset is the Ladybug database, given with `--ladybug` (`-l`) or `ONTOBUG_LADYBUG` (default: the dataset stem with `.lbdb`, so `hr.trig` goes with `hr.lbdb`). It holds every triple losslessly as `DataTriple` rows, plus the registry and the projected schemas. `--dataset` (`-d`, `ONTOBUG_DATASET`, default `dataset.trig`) is the TriG/N-Quads snapshot: each command that changes content rewrites it atomically, and opening with an empty database seeds from it.
+Every command works on one dataset, and the dataset is the Ladybug database, given with `--ladybug` (`-l`) or `ONTOBUG_LADYBUG` (default: the dataset stem with `.lbdb`, so `hr.trig` goes with `hr.lbdb`). It holds every triple losslessly as `RdfNode`/`Statement` nodes and edges, plus the registry and the projected schemas. `--dataset` (`-d`, `ONTOBUG_DATASET`, default `dataset.trig`) is the TriG/N-Quads snapshot: each command that changes content rewrites it atomically, and opening with an empty database seeds from it.
 
 The whole HR walkthrough in one go:
 
@@ -810,29 +810,95 @@ c.save("hr.trig")?;
 | `validate(g, &ValidateOptions)`, `validate_shex(g, shexc, base, map)` | Validate from the triple rows |
 | `cypher(cypher)`, `namespaces()` | Run Cypher against the database; list the namespace subgraphs |
 
-## 15. Registry schema reference
+## 15. Database tour: tables and traversal
 
-One `SchemaEntry` node per registration (`id` is graph plus role): `graph`, `role`
-(`ontology`, `shacl`, `shex`), `ontologyIri`, `version`, `sha256`, `active`, `loadedAt`,
-and the `appliesTo` / `imports` lists as JSON arrays (empty `appliesTo` is every graph).
+Everything lives in one `.lbdb`: the registry, the projected schemas, every triple,
+and the namespace inventory. `show_graphs()` lists each table as a `STANDARD` graph —
+Ladybug exposes tables that way; query them with plain `MATCH`:
 
-Projected content, rebuilt by `add` and `ontobug project` (every content node also
-carries its `namespace`):
+```cypher
+MATCH (e:SchemaEntry) RETURN e.graph, e.role;                 -- the registry
+MATCH (c:OntologyClass) WHERE c.iri CONTAINS 'Person' RETURN c.iri, c.label;
+MATCH (a:RdfNode)-[r:Statement]->(b:RdfNode)                  -- any triple
+WHERE a.id = '<https://example.org/people/alice>'
+RETURN r.predicate, b.id;
+```
 
-| Table | Kind | Properties / meaning |
+How the tables connect:
+
+```
+SchemaEntry                          registry: graph, role, targets, version, sha256 …
+
+OntologyClass <--SUBCLASS_OF--> OntologyClass      class hierarchy (all graphs,
+OntologyClass <--EQUIVALENT_CLASS--> OntologyClass  shared IRIs stay connected)
+OntologyProperty --DOMAIN/RANGE--> OntologyClass
+
+ShaclShape --HAS_CONSTRAINT--> ShaclProperty --ON_PROPERTY--> OntologyProperty
+    \--TARGETS--> OntologyClass
+
+RdfNode --Statement--> RdfNode                     every triple of every graph:
+                                                     predicate/graph/namespace/ord on the rel
+Namespace                              inventory of the namespaces below
+```
+
+| Table | Kind | Columns / meaning |
 |---|---|---|
+| `SchemaEntry` | node | one per registration (`id` is graph plus role): `graph`, `role` (`ontology`, `shacl`, `shex`), `ontologyIri`, `version`, `sha256`, `active`, `loadedAt`, `appliesTo` / `imports` (JSON; empty `appliesTo` is every graph) |
 | `OntologyClass` | node | `iri`, `label`, `comment`, owning `graph`; empty label is a stub: referenced, defined nowhere |
 | `OntologyProperty` | node | `iri`, `kind` (`object`, `datatype`, `annotation`, `property`), `label`, `comment`, `rangeDatatypes` (JSON), `graph` |
 | `ShaclShape` | node | `shape`, `targetClasses` / `targetNodes` / `targetSubjectsOf` / `targetObjectsOf` (JSON), `message`, `severity`, `deactivated`, `graph` |
 | `ShaclProperty` | node | `shapeId`, `path`, `datatype`, `class`, `nodeKind`, `minCount`, `maxCount`, `pattern`, `minInclusive`, `maxInclusive`, `message`, `severity`, `deactivated`, `graph` |
-| `SUBCLASS_OF`, `EQUIVALENT_CLASS` | rel | Class to class |
-| `DOMAIN`, `RANGE` | rel | Property to class |
-| `HAS_CONSTRAINT` | rel | Shape to its property constraints |
-| `TARGETS` | rel | Shape to the classes of its target classes, whatever graph defined them |
-| `ON_PROPERTY` | rel | Constraint to the property of its path |
-| `Namespace` | node | `iri`, `prefix`, `sourceGraphs` (JSON), `termCount`, `triples` |
-| `DataTriple` | node | `subject`, `predicate`, `object` as N-Triples tokens, `lex` (unescaped literal value), `namespace`, `graph`; `id` is graph plus zero-padded ordinal, so `ORDER BY id` reproduces document order |
-| `Namespace` | node | `iri`, `prefix`, `sourceGraphs` (JSON), `termCount`; one per namespace in the projected content |
+| `SUBCLASS_OF`, `EQUIVALENT_CLASS` | rel | class to class |
+| `DOMAIN`, `RANGE` | rel | property to class |
+| `HAS_CONSTRAINT` | rel | shape to its property constraints |
+| `TARGETS` | rel | shape to the classes of its target classes, whatever graph defined them |
+| `ON_PROPERTY` | rel | constraint to the property of its path |
+| `RdfNode` | node | one per distinct term: `id` is the N-Triples token (`<iri>`, `_:label`, `"lex"…`), `kind` (`iri`, `blank`, `literal`), `value` (bare IRI, blank label, or literal lexicon), `datatype`, `lang`, `namespace` |
+| `Statement` | rel | one per distinct triple: `predicate` (bare IRI), `graph` (token or `DEFAULT`), `namespace` (subject's), `ord` (per-graph order, for deterministic dumps) |
+
+### Traversing it
+
+Start from the registry to find what governs a data graph, then walk:
+
+```cypher
+-- class hierarchy, transitively, across graphs
+MATCH (c:OntologyClass)-[:SUBCLASS_OF*1..5]->(s:OntologyClass)
+WHERE c.iri = 'https://example.org/hr#Manager' RETURN s.iri;
+-- shape to the properties it checks, through the ontology
+MATCH (s:ShaclShape)-[:TARGETS]->(c:OntologyClass)<-[:DOMAIN]-(p:OntologyProperty)
+WHERE c.iri = 'http://schema.org/Person' RETURN s.shape, p.iri;
+-- triple walks: outgoing, incoming, and multi-hop over Statement
+MATCH (a:RdfNode)-[r:Statement]->(b:RdfNode)
+WHERE a.id = '<https://example.org/people/alice>' RETURN r.predicate, b.id;
+MATCH (b:RdfNode)<-[r:Statement]-(a:RdfNode)
+WHERE b.id = '<https://example.org/people/acme>' RETURN a.id, r.predicate;
+MATCH (a:RdfNode)-[r:Statement*1..2]->(b:RdfNode)
+WHERE a.id = '<https://example.org/people/alice>' RETURN DISTINCT b.id LIMIT 10;
+-- literal values live on the object node
+MATCH (a:RdfNode)-[r:Statement]->(b:RdfNode)
+WHERE r.predicate = 'http://schema.org/email' RETURN b.value;
+```
+
+### Namespaces as subgraphs
+
+RDF namespaces partition *names*, not data: the namespace of a term is its IRI up to
+and including the last `#` or `/` (`http://schema.org/Person` → `http://schema.org/`).
+Every content node and every statement carries its subject's `namespace`, so each
+namespace is a queryable subgraph of the one connected graph — cross-namespace edges
+(a shape targeting a foreign class, a subclass in another vocabulary) stay traversable,
+which physically separate graphs would break.
+
+`Namespace` nodes inventory them: `iri`, `prefix`, `sourceGraphs` (JSON), `termCount`
+(projected nodes), `triples` (statements). Prefixes come from the documents' `@prefix`
+declarations when present, and are derived from the IRI otherwise (`…/hr#` → `hr`,
+`http://schema.org/` → `schema`); blank-node subjects have no namespace and are not
+inventoried. `ontobug namespaces` prints the table; scope any traversal with
+`WHERE n.namespace = '…'` (nodes) or `WHERE r.namespace = '…'` (statements):
+
+```cypher
+MATCH (n:Namespace) RETURN n.prefix, n.iri, n.termCount ORDER BY n.prefix;
+MATCH (c:OntologyClass) WHERE c.namespace = 'http://schema.org/' RETURN count(c);
+```
 
 ## 16. Compatibility and limits
 
@@ -844,9 +910,7 @@ still validates it ([§13](#13-using-another-shacl-processor)).
 
 **Limits:**
 
-- **Storage.** Everything lives in a Ladybug `.lbdb` database: triple rows, registry
-and projections. TriG/N-Quads files are snapshots — written by save/export, read only
-to seed an empty database.
+- **Storage.** Everything lives in a Ladybug `.lbdb` database: `RdfNode`/`Statement` triple graph, registry, projections and namespace inventory. TriG/N-Quads files are snapshots — written by save/export, read only to seed an empty database.
 - **Projection is one-way.** Ladybug mirrors the RDF graphs for querying; edit the
 documents, `add` them again, and the projection rebuilds.
 - **No OWL reasoner.** Ontologies take part in validation through class membership only (§8.3). Ontobug checks neither OWL consistency nor property characteristics.

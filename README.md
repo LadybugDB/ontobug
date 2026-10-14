@@ -28,7 +28,7 @@ MATCH (e:SchemaEntry) RETURN e.graph, e.role, e.appliesTo, e.version, e.active;
 - **Ontology-aware SHACL.** The ontologies in scope join the data graph, so `sh:targetClass core:Person` also checks every `hr:Manager`.
 - **Checked registry.** `ontobug check` validates the registrations structurally (no duplicate roles, well-formed digests).
 - **Drift detection.** `ontobug verify` compares a file with the SHA-256 recorded when it was loaded.
-- **Cypher, not SPARQL.** Ladybug is the database: every triple lives there losslessly as a `DataTriple` row, alongside the registry and the projected schemas, all through parameterised Cypher (`lbug` crate). TriG/N-Quads files are snapshots for exchange.
+- **Cypher, not SPARQL.** Ladybug is the database: every triple lives there as `RdfNode` nodes and `Statement` rels, alongside the registry and the projected schemas, all through parameterised Cypher (`lbug` crate) and native `COPY` bulk loads. TriG/N-Quads files are snapshots for exchange.
 - **Schemas as graphs, not just metadata.** Beyond the registry, the schema content itself is projected into Ladybug: ontology classes and properties with `SUBCLASS_OF`, `EQUIVALENT_CLASS`, `DOMAIN` and `RANGE` edges, SHACL shapes with `HAS_CONSTRAINT` edges linked back via `TARGETS` and `ON_PROPERTY`. Walk a class hierarchy or a shape-to-property path in Cypher.
 - **Namespaces as subgraphs.** Every term is partitioned by its RDF namespace into a queryable subgraph: `Namespace` nodes inventory prefix, IRI, term counts and source graphs (prefixes harvested from `@prefix` declarations, derived otherwise). Real schema.org projects to 50 namespaces out of the box.
 
@@ -53,8 +53,8 @@ cargo install --path .
 | `verify GRAPH --file F` | Detect drift from the recorded SHA-256 |
 | `validate GRAPH [--shapes G]… [--no-ontologies] [--output json]` | Validate with SHACL |
 | `shex GRAPH --schema F --map M` | Validate a shape map with ShEx |
-| `cypher CYPHER` | Run Cypher against the schema registry, rows as TSV |
-| `namespaces` | List the namespaces in the projected content: prefix, IRI, terms, graphs |
+| `cypher CYPHER` | Run Cypher against the database, rows as TSV |
+| `namespaces` | List the namespaces: prefix, IRI, terms, triples, graphs |
 | `project GRAPH` | (Re)build a graph's Ladybug nodes and edges from its RDF content (`add` already does this for ontology and shapes graphs) |
 | `export [GRAPH]` | Print the dataset as TriG, or one graph as N-Triples |
 
