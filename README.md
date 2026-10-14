@@ -29,6 +29,7 @@ MATCH (e:SchemaEntry) RETURN e.graph, e.role, e.appliesTo, e.version, e.active;
 - **Checked registry.** `ontobug check` validates the registrations structurally (no duplicate roles, well-formed digests).
 - **Drift detection.** `ontobug verify` compares a file with the SHA-256 recorded when it was loaded.
 - **Cypher, not SPARQL.** The registry is a property graph: every registry operation is parameterised Cypher through the `lbug` crate. RDF content stays in TriG/N-Quads files for validation and exchange.
+- **Schemas as graphs, not just metadata.** Beyond the registry, the schema content itself is projected into Ladybug: ontology classes and properties with `SUBCLASS_OF`, `EQUIVALENT_CLASS`, `DOMAIN` and `RANGE` edges, SHACL shapes with `HAS_CONSTRAINT` edges linked back via `TARGETS` and `ON_PROPERTY`. Walk a class hierarchy or a shape-to-property path in Cypher.
 
 ## Install
 
@@ -52,6 +53,7 @@ cargo install --path .
 | `validate GRAPH [--shapes G]… [--no-ontologies] [--output json]` | Validate with SHACL |
 | `shex GRAPH --schema F --map M` | Validate a shape map with ShEx |
 | `cypher CYPHER` | Run Cypher against the schema registry, rows as TSV |
+| `project GRAPH` | (Re)build a graph's Ladybug nodes and edges from its RDF content (`add` already does this for ontology and shapes graphs) |
 | `export [GRAPH]` | Print the dataset as TriG, or one graph as N-Triples |
 
 The dataset file is set with `-d FILE` or `ONTOBUG_DATASET` (default `dataset.trig`; TriG or N-Quads). The Ladybug registry is set with `-l FILE` or `ONTOBUG_LADYBUG` (default: the dataset stem with `.lbdb`, e.g. `dataset.lbdb` next to `dataset.trig`). The registry needs no saving: Ladybug persists it as it changes.

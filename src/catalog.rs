@@ -10,7 +10,7 @@
 //! store directly, without a query language.
 
 use crate::error::{Error, Result};
-use crate::ladybug::LadybugSchemaStore;
+use crate::ladybug::{LadybugSchemaStore, Projected};
 use crate::registry::{self, owl, rdfs, SchemaGraph, SchemaRole, RDF_TYPE};
 use crate::validate::{self, Mode, Report, ShexResult};
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
@@ -291,6 +291,11 @@ impl Catalog {
             e.version = e.version.or(version);
         }
         self.register(&e)?;
+        if matches!(role, SchemaRole::Ontology | SchemaRole::Shacl) {
+            // The schema itself is stored in Ladybug as nodes and edges, not just
+            // registered: re-projecting replaces the graph's previous projection.
+            self.project_graph_content(graph)?;
+        }
         Ok(self
             .list()?
             .into_iter()
@@ -383,6 +388,8 @@ impl Catalog {
 
     /// Removes a registration and every triple of its graph.
     pub fn drop_graph(&self, graph: GraphNameRef<'_>) -> Result<()> {
+        self.registry
+            .clear_content_projection(&graph.into_owned())?;
         self.registry.remove_graph(&graph.into_owned())?;
         self.store.clear_graph(graph)?;
         Ok(())
@@ -404,6 +411,66 @@ impl Catalog {
     /// Every registration, once per role, ordered by role and graph.
     pub fn list(&self) -> Result<Vec<SchemaGraph>> {
         self.registry.load_entries()
+    }
+
+    /// The RDF triples of a graph, read from the store directly.
+    fn graph_triples(&self, graph: GraphNameRef<'_>) -> Result<Vec<oxrdf::Triple>> {
+        let target = graph.into_owned();
+        let mut out = Vec::new();
+        for q in self
+            .store
+            .iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        {
+            if q.graph_name == target {
+                out.push(oxrdf::Triple {
+                    subject: q.subject,
+                    predicate: q.predicate,
+                    object: q.object,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stores a registered graph's content in Ladybug as nodes and edges, replacing its
+    /// previous projection: ontology classes and properties with `SUBCLASS_OF`,
+    /// `EQUIVALENT_CLASS`, `DOMAIN` and `RANGE` edges, SHACL shapes with
+    /// `HAS_CONSTRAINT` edges linked back via `TARGETS` and `ON_PROPERTY` (rebuilt over
+    /// all shapes, since their links may point into the rebuilt graph). Unregistering
+    /// keeps the projection with the triples; [`Catalog::drop_graph`] removes both.
+    pub fn project_graph_content(&self, graph: GraphNameRef<'_>) -> Result<Projected> {
+        let entries: Vec<SchemaGraph> = self
+            .list()?
+            .into_iter()
+            .filter(|e| e.graph.as_ref() == graph)
+            .collect();
+        if entries.is_empty() {
+            return Err(Error::NotRegistered(graph.to_string()));
+        }
+        let owned = graph.into_owned();
+        let triples = self.graph_triples(graph)?;
+        self.registry.clear_content_projection(&owned)?;
+        let mut projected = Projected::default();
+        for e in &entries {
+            match e.role {
+                SchemaRole::Ontology => {
+                    let (classes, properties, edges) =
+                        self.registry.project_ontology(&owned, &triples)?;
+                    projected.classes += classes;
+                    projected.properties += properties;
+                    projected.edges += edges;
+                }
+                SchemaRole::Shacl => {
+                    let (shapes, constraints) = self.registry.project_shapes(&owned, &triples)?;
+                    projected.shapes += shapes;
+                    projected.constraints += constraints;
+                }
+                SchemaRole::Shex => {}
+            }
+        }
+        projected.links = self.registry.relink_shapes()?;
+        Ok(projected)
     }
 
     /// What is wrong with the registry: structural violations over the Ladybug entries.

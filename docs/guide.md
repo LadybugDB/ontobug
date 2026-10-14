@@ -131,6 +131,36 @@ ontobug add ontology https://example.org/onto/hr --file hr.ttl -t https://exampl
 ontobug add shacl    https://example.org/onto/hr --file hr-shapes.ttl -t https://example.org/data/staff
 ```
 
+## 3.1 Schema content as nodes and edges
+
+The registry says *which* graphs hold schemas. The schemas *themselves* are projected
+into Ladybug as a property graph — `add` does this automatically for ontology and shapes
+graphs, and `ontobug project GRAPH` rebuilds a graph's projection:
+
+```sh
+$ ontobug project https://example.org/onto/hr
+projected <https://example.org/onto/hr>: 5 classes, 6 properties, 10 edges, 0 shapes, 0 constraints, 8 links
+```
+
+(The 5 classes include stubs for `core:Person` and `core:Organization`, which this
+graph references but only the core graph defines — project it too and the stubs give
+way to shared nodes.)
+
+- Ontology classes and properties become `OntologyClass` / `OntologyProperty` nodes
+  (IRI, label, comment, owning graph), with `SUBCLASS_OF`, `EQUIVALENT_CLASS`, `DOMAIN`
+  and `RANGE` edges. References to classes no graph defines (an `owl:equivalentClass` to
+  an external ontology) become labelled-empty stubs, so edges stay connected. Datatype
+  ranges (`xsd:string`, …) are kept as a `rangeDatatypes` list on the property.
+- SHACL shapes become `ShaclShape` nodes with `ShaclProperty` constraint nodes
+  (path, datatype, class, counts, pattern, message, …) over `HAS_CONSTRAINT` edges.
+- `TARGETS` links shapes to the `OntologyClass` nodes of their target classes (whatever
+graph defined them), and `ON_PROPERTY` links constraints to their `OntologyProperty`
+nodes — rebuilt over all shapes after every projection, since rebuilding a graph
+deletes the class nodes its shapes pointed at.
+
+So the class hierarchy and the shape-to-property paths are queryable (see [§12](#12-cypher-recipes)).
+Unregistering keeps a graph's projection with its triples; `remove --drop` deletes both.
+
 ## 4. Adding an OWL ontology
 
 ### 4.1 Write the ontology
@@ -200,8 +230,8 @@ ontology active   <https://example.org/onto/hr> -> <https://example.org/data/sta
 `add` does four things in one go:
 
 1. **Clears** the graph and loads the file into it.
-2. **Reads the header.** If the graph declares exactly one `owl:Ontology` whose IRI differs from the graph name, it records it as `oxl:ontologyIri`. If you give no `--version`, it pins `owl:versionIRI`, or else `owl:versionInfo`.
-3. **Records the file's SHA-256** as `oxl:sha256`, for drift detection (see [§11](#11-lifecycle-versions-drift-deactivation-removal)).
+2. **Reads the header.** If the graph declares exactly one `owl:Ontology` whose IRI differs from the graph name, it records it as `ontologyIri`. If you give no `--version`, it pins `owl:versionIRI`, or else `owl:versionInfo`.
+3. **Records the file's SHA-256** as `sha256`, for drift detection (see [§11](#11-lifecycle-versions-drift-deactivation-removal)).
 4. **Writes the registration**, replacing any earlier description of the graph.
 
 Options:
@@ -210,7 +240,7 @@ Options:
 |---|---|
 | `-t, --applies-to G` | A data graph it governs; repeatable. `ALL`, or no option at all, means every graph |
 | `--version V` | Pin a version instead of the one read from the header |
-| `--import IRI` | Record an import in the registry (`oxl:imports`); repeatable |
+| `--import IRI` | Record an import in the registry (`imports`); repeatable |
 | `--inactive` | Register it switched off |
 
 **Naming the graph.** The graph name and the ontology IRI can be the same (`ontobug add ontology https://example.org/hr# …`). A separate graph name such as `…/onto/hr` lets you load two versions of one ontology side by side, as `…/onto/hr/2.0` and `…/onto/hr/2.1`.
@@ -219,7 +249,7 @@ Options:
 
 During SHACL validation, the ontologies in scope for a data graph join the data graph. Ontobug also writes out the `rdf:type` triples they entail through `rdfs:subClassOf` and `owl:equivalentClass`. That is what makes `sh:targetClass core:Person` reach an `hr:Manager` (see [§8.3](#83-why-ontologies-take-part-in-validation)).
 
-Ontobug does not run a full OWL reasoner and does not check OWL consistency. To use the ontologies for query-time reasoning, open the dataset in [oxilite](https://oxilitedb.com), which reads the same registry and scopes RDFS/OWL-QL reasoning per data graph. You can also export the graphs to an OWL reasoner.
+Ontobug does not run a full OWL reasoner and does not check OWL consistency. To use the ontologies for query-time reasoning, export the graphs (`ontobug export`) to an OWL reasoner.
 
 ## 5. Imports between ontologies
 
@@ -228,10 +258,10 @@ An ontology's scope includes the **active, registered** ontologies it imports, t
 **Where imports come from:**
 
 - `owl:imports` asserted inside the ontology's own graph, as in `hr.ttl` above;
-- `oxl:imports` recorded in the registry (`--import`);
+- `imports` recorded in the registry (`--import`);
 - `owl:imports` recorded in the registry. Older registries of vocabulary 2 used it, and it is still read.
 
-**What an import matches:** a registered ontology's graph name, or its `oxl:ontologyIri`. `hr.ttl` imports `<https://example.org/core#>`. That is the `oxl:ontologyIri` of the graph `<https://example.org/onto/core>`, so core joins the scope:
+**What an import matches:** a registered ontology's graph name, or its `ontologyIri`. `hr.ttl` imports `<https://example.org/core#>`. That is the `ontologyIri` of the graph `<https://example.org/onto/core>`, so core joins the scope:
 
 ```sh
 $ ontobug scope https://example.org/data/staff
@@ -257,7 +287,7 @@ ontology <https://example.org/onto/hr>
 shacl    <https://example.org/shapes/hr>
 ```
 
-**Why the registry uses `oxl:imports` and not `owl:imports`.** The domain of `owl:imports` is `owl:Ontology`. In the registry, it would make every registration an ontology, shapes graphs included, and an OWL tool loading the registry would try to fetch every import.
+**Why the registry uses its own `imports` and not `owl:imports`.** The domain of `owl:imports` is `owl:Ontology`, so in an RDF registry every registration would read as an ontology. Ladybug nodes carry no such entailment, but the split is kept: `owl:imports` asserted *inside* an ontology's graph, `imports` recorded *about* it in the registry.
 
 ## 6. Adding SHACL shapes
 
@@ -372,10 +402,10 @@ ontobug add shacl https://example.org/shapes/payroll --file payroll.ttl -t https
 
 ## 7. Mapping schemas to data graphs
 
-`oxl:appliesTo` says which data a schema describes:
+`appliesTo` says which data a schema describes:
 
-- **`oxl:AllGraphs`, or no `oxl:appliesTo` at all:** every graph.
-- **One or more graph IRIs, or `oxl:DefaultGraph`:** only those graphs. If `oxl:AllGraphs` is among them, it wins.
+- **An empty `appliesTo` list:** every graph (`ALL` on the CLI).
+- **One or more graph IRIs, or `DEFAULT`:** only those graphs.
 
 Change only the targets, keeping roles, version and everything else:
 
@@ -386,12 +416,15 @@ ontobug map https://example.org/shapes/hr --to ALL
 
 Per-graph mapping lets conflicting schemas live side by side:
 
-```trig
-<oxilite:schema> {
-  <https://ex.org/onto/zoo>    a oxl:OntologyGraph ; oxl:appliesTo <https://ex.org/data/zoo> .
-  <https://ex.org/onto/garden> a oxl:OntologyGraph ; oxl:appliesTo <https://ex.org/data/garden> .
-  <https://ex.org/onto/common> a oxl:OntologyGraph ; oxl:appliesTo oxl:AllGraphs .
-}
+```cypher
+MATCH (e:SchemaEntry)
+WHERE e.graph IN ['https://ex.org/onto/zoo', 'https://ex.org/onto/garden',
+                  'https://ex.org/onto/common']
+RETURN e.graph, e.appliesTo;
+
+// https://ex.org/onto/zoo       ["https://ex.org/data/zoo"]
+// https://ex.org/onto/garden    ["https://ex.org/data/garden"]
+// https://ex.org/onto/common    []   <- every graph
 ```
 
 Here a `ex:Dog` in the zoo graph is read with the zoo and common ontologies. A `ex:Dog` in the garden graph is read with the garden and common ones.
@@ -496,10 +529,10 @@ ontobug -d release.trig validate https://example.org/data/staff --output json > 
 
 For a data graph `D`:
 
-1. **Shapes:** every *active* shapes graph whose `oxl:appliesTo` includes `D`, `oxl:AllGraphs`, or nothing. Their union is the shapes graph. Pass `--shapes G` (repeatable) to use named shapes graphs instead, registered or not. If no shapes apply, `validate` fails with exit code 2. It never guesses.
+1. **Shapes:** every *active* shapes graph whose `appliesTo` includes `D`, or is empty. Their union is the shapes graph. Pass `--shapes G` (repeatable) to use named shapes graphs instead, registered or not. If no shapes apply, `validate` fails with exit code 2. It never guesses.
 2. **Ontologies:** every active ontology that applies to `D`, plus the active ontologies they import, transitively. `--no-ontologies` leaves them out.
 3. **Data graph:** `D`'s triples, plus the ontologies' triples, plus the `rdf:type` triples they entail (see §8.3).
-4. **Engine:** [rudof](https://rudof-project.github.io/)'s native SHACL engine. `--sparql` uses its SPARQL-based engine instead.
+4. **Engine:** [rudof](https://rudof-project.github.io/)'s native SHACL engine.
 
 `ontobug scope D` prints steps 1 and 2 without validating.
 
@@ -573,52 +606,29 @@ ok   https://example.org/people/bob@https://example.org/hr/shex#Employee
 
 The exit code is `1` when any node fails. To keep a ShEx schema in the dataset, register its RDF form (ShExR, in Turtle for example) with `ontobug add shex …`. It is then recorded and mapped like the other roles. The `shex` command reads the ShExC text from `--schema`.
 
-## 10. Validating the registry itself
+## 10. Checking the registry
 
-A registry written by hand, or by another tool, can be wrong. The vocabulary ships `oxl:RegistrationShape`, so the registry checks itself:
-
-```turtle
-oxl:RegistrationShape a sh:NodeShape ;
-    sh:targetClass oxl:OntologyGraph , oxl:ShapesGraph , oxl:ShExGraph , oxl:SystemGraph ;
-    sh:targetSubjectsOf oxl:appliesTo , oxl:active , oxl:ontologyIri , oxl:version ,
-                        oxl:sha256 , oxl:loadedAt , oxl:imports ;
-    sh:nodeKind sh:IRI ;
-    sh:property [
-        sh:path rdf:type ;
-        sh:qualifiedValueShape [ sh:in ( oxl:OntologyGraph oxl:ShapesGraph oxl:ShExGraph oxl:SystemGraph ) ] ;
-        sh:qualifiedMinCount 1 ;
-        sh:message "A registration needs a role class: oxl:OntologyGraph, oxl:ShapesGraph or oxl:ShExGraph."
-    ] ;
-    sh:property [ sh:path oxl:active ; sh:maxCount 1 ; sh:datatype xsd:boolean ] ;
-    sh:property [ sh:path oxl:appliesTo ; sh:nodeKind sh:IRI ] ;
-    sh:property [ sh:path oxl:sha256 ; sh:maxCount 1 ; sh:datatype xsd:string ;
-                  sh:pattern "^[0-9a-f]{64}$" ] ;
-    # … ontologyIri, version, loadedAt, imports
-    .
-```
-
-`ontobug check` runs two checks: a plain Rust check of the same constraints, which needs no SHACL engine, and the SHACL shape itself through rudof. Break the registry on purpose:
+A registration written out of band can be wrong: a digest that is not 64 lowercase
+hex digits, or a graph registered twice in one role. `ontobug check` runs the
+structural checks over the Ladybug registry and exits `1` on problems:
 
 ```sh
-$ ontobug update 'PREFIX oxl: <https://oxilite.dev/ns#>
-    INSERT DATA { GRAPH <oxilite:schema> {
-      <https://example.org/onto/hr> oxl:active "no" ; oxl:sha256 "ABC" .
-      <https://example.org/x> oxl:appliesTo oxl:AllGraphs } }'
-
 $ ontobug check
-<https://example.org/onto/hr>: <https://oxilite.dev/ns#active> has 2 values, at most one is allowed
-<https://example.org/onto/hr>: <https://oxilite.dev/ns#sha256> has 2 values, at most one is allowed
-<https://example.org/onto/hr>: <https://oxilite.dev/ns#active> "no" is not an <http://www.w3.org/2001/XMLSchema#boolean>
-<https://example.org/onto/hr>: <https://oxilite.dev/ns#sha256> "ABC" is not 64 lowercase hex digits
-<https://example.org/x>: has registration properties but no role class (oxl:OntologyGraph, oxl:ShapesGraph, oxl:ShExGraph)
-conforms: no (5 results)
-- Violation https://example.org/onto/hr https://oxilite.dev/ns#active = "no"
-    sh:DatatypeConstraintComponent
-    Expected Datatype: xsd:boolean
-…
+registry ok (3 registrations)
 ```
 
-The two checks find the same five problems, and the exit code is `1`. Readers stay lenient meanwhile: they ignore a value that breaks the shapes and never guess what it meant. Run `check` after any hand edit.
+Break one on purpose through Cypher (Ladybug has no constraints of its own, so
+anything goes until `check` runs):
+
+```sh
+$ ontobug cypher "MATCH (e:SchemaEntry) WHERE e.graph = 'https://example.org/onto/hr' SET e.sha256 = 'ABC' RETURN e.graph"
+
+$ ontobug check
+<https://example.org/onto/hr>: sha256 ABC is not 64 lowercase hex digits
+```
+
+Fix it by re-adding the graph (`add` rewrites the registration and re-projects the
+content), then `check` is green again. Run `check` after any hand edit.
 
 ## 11. Lifecycle: versions, drift, deactivation, removal
 
@@ -648,106 +658,63 @@ ontobug validate https://example.org/data/staff \
 
 | Command | Registration | Graph's triples |
 |---|---|---|
-| `deactivate G` | Kept, `oxl:active false`. Out of every scope and never imported | Kept |
-| `activate G` | `oxl:active true` | Kept |
+| `deactivate G` | Kept, `active` false. Out of every scope and never imported | Kept |
+| `activate G` | `active` true | Kept |
 | `remove G` | Deleted | Kept, as an ordinary graph |
 | `remove G --drop` | Deleted | Deleted |
 
 `map`, `activate`, `deactivate` and `remove` fail with exit code 2 on a graph that is not registered.
 
-## 12. SPARQL recipes for any store
+## 12. Cypher recipes
 
-These are the exact updates Ontobug runs (`ontobug::registry::*_update`). They work unchanged with `ontobug update`, on Oxigraph, on oxilite, or on any SPARQL 1.1 store.
+The registry and the projected schemas are plain Ladybug nodes and edges. Run these
+with `ontobug cypher`, or any Ladybug client against the `.lbdb` file.
 
-Register an ontology for two graphs, replacing any earlier description:
+Registrations: the active shapes graphs and what they govern:
 
-```sparql
-PREFIX oxl: <https://oxilite.dev/ns#>
-CREATE SILENT GRAPH <https://ex.org/onto/hr> ;
-DELETE WHERE { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> ?p ?o } } ;
-INSERT DATA { GRAPH <oxilite:schema> {
-  <https://ex.org/onto/hr> a oxl:OntologyGraph ; oxl:active true ;
-      oxl:appliesTo <https://ex.org/data/staff> , <https://ex.org/data/contractors> .
-} }
+```cypher
+MATCH (e:SchemaEntry)
+WHERE e.role = 'shacl' AND e.active = true
+RETURN e.graph, e.appliesTo ORDER BY e.graph;
 ```
 
-Give a graph a second role:
+Class hierarchy: superclasses of a class, transitively:
 
-```sparql
-PREFIX oxl: <https://oxilite.dev/ns#>
-INSERT DATA { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> a oxl:ShapesGraph } }
+```cypher
+MATCH (c:OntologyClass)-[:SUBCLASS_OF*1..5]->(s:OntologyClass)
+WHERE c.iri = 'https://example.org/hr#Manager'
+RETURN s.iri;
 ```
 
-Change only the targets:
+Properties of a class: everything with a domain (or range) on it:
 
-```sparql
-PREFIX oxl: <https://oxilite.dev/ns#>
-DELETE { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> oxl:appliesTo ?t } }
-INSERT { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> oxl:appliesTo oxl:AllGraphs } }
-WHERE  { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> a ?role
-         OPTIONAL { <https://ex.org/onto/hr> oxl:appliesTo ?t } } }
+```cypher
+MATCH (p:OntologyProperty)-[:DOMAIN]->(c:OntologyClass)
+WHERE c.iri = 'https://example.org/hr#Employee'
+RETURN p.iri, p.kind;
 ```
 
-Deactivate:
+Shapes to data, through the ontology: which shapes target a class, and which
+properties their constraints check:
 
-```sparql
-PREFIX oxl: <https://oxilite.dev/ns#>
-DELETE { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> oxl:active ?a } }
-INSERT { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> oxl:active false } }
-WHERE  { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> a ?role
-         OPTIONAL { <https://ex.org/onto/hr> oxl:active ?a } } }
+```cypher
+MATCH (s:ShaclShape)-[:TARGETS]->(c:OntologyClass)<-[:DOMAIN]-(p:OntologyProperty)
+WHERE c.iri = 'http://schema.org/Person'
+RETURN s.shape, p.iri;
 ```
 
-Unregister (the triples stay), or drop with the triples:
+Constraint details for one path:
 
-```sparql
-DELETE WHERE { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> ?p ?o } }
+```cypher
+MATCH (p:ShaclProperty) WHERE p.path = 'https://example.org/hr#salary'
+RETURN p.datatype, p.minCount, p.maxCount, p.minInclusive, p.message;
 ```
 
-```sparql
-DELETE WHERE { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> ?p ?o } } ;
-DROP SILENT GRAPH <https://ex.org/onto/hr>
+Stubs: classes referenced but defined nowhere (external imports worth registering):
+
+```cypher
+MATCH (c:OntologyClass) WHERE c.label = '' RETURN c.graph, c.iri;
 ```
-
-Find the active shapes graphs for a data graph. `?a = false` compares values, so `"0"^^xsd:boolean` matches and a plain `"false"` does not, just as Ontobug reads it:
-
-```sparql
-PREFIX oxl: <https://oxilite.dev/ns#>
-SELECT ?shapes WHERE {
-  GRAPH <oxilite:schema> {
-    ?shapes a oxl:ShapesGraph .
-    FILTER NOT EXISTS { ?shapes oxl:active ?a FILTER (?a = false) }
-    FILTER (NOT EXISTS { ?shapes oxl:appliesTo ?any }
-            || EXISTS { ?shapes oxl:appliesTo <https://example.org/data/staff> }
-            || EXISTS { ?shapes oxl:appliesTo oxl:AllGraphs })
-  }
-}
-```
-
-Query the data without the schema graphs:
-
-```sparql
-SELECT ?s ?p ?o WHERE {
-  GRAPH ?g { ?s ?p ?o }
-  FILTER (?g NOT IN (<oxilite:schema>, <oxilite:vocabulary>))
-  FILTER NOT EXISTS { GRAPH <oxilite:schema> { ?g a ?role } }
-}
-```
-
-Derive `sh:shapesGraph` for a SHACL tool that expects it. It is the reverse of `oxl:appliesTo`, and Ontobug does not store it, so the two cannot drift apart:
-
-```sparql
-PREFIX oxl: <https://oxilite.dev/ns#>
-PREFIX sh:  <http://www.w3.org/ns/shacl#>
-CONSTRUCT { ?data sh:shapesGraph ?shapes }
-WHERE { GRAPH <oxilite:schema> {
-  ?shapes a oxl:ShapesGraph ; oxl:appliesTo ?data .
-  FILTER (?data != oxl:AllGraphs)
-  FILTER NOT EXISTS { ?shapes oxl:active ?a FILTER (?a = false) }
-} }
-```
-
-`dcterms:conformsTo` (as in DCAT) is derived the same way, with `?data dcterms:conformsTo ?schema`.
 
 ## 13. Using another SHACL processor
 
@@ -767,20 +734,6 @@ cat hr.nt core.nt > ontologies.nt
 pyshacl -s shapes.nt -e ontologies.nt -i rdfs -f human data.nt
 ```
 
-**Apache Jena:**
-
-```sh
-cat data.nt hr.nt core.nt > data+ontologies.nt
-shacl validate --shapes shapes.nt --data data+ontologies.nt
-```
-
-Validate the registry itself with `vocab/oxl.ttl` as the shapes graph:
-
-```sh
-ontobug export oxilite:schema > registry.nt
-pyshacl -s vocab/oxl.ttl -f human registry.nt
-```
-
 ## 14. Rust API
 
 ```toml
@@ -792,8 +745,7 @@ ontobug = { git = "…", default-features = false }   # no CLI dependencies
 use ontobug::oxigraph::io::RdfFormat;
 use ontobug::{AddOptions, Catalog, SchemaRole, ValidateOptions, parse_graph, parse_targets};
 
-let c = Catalog::open("hr.trig")?;          // or Catalog::new() for an empty in-memory dataset
-c.install_system_graphs()?;
+let c = Catalog::open("hr.trig", "hr.lbdb")?;   // or Catalog::new() for empty in-memory state
 
 let staff = parse_graph("https://example.org/data/staff")?;
 c.add(
@@ -815,53 +767,55 @@ c.save("hr.trig")?;
 
 | `Catalog` method | Does |
 |---|---|
-| `new`, `open(path)`, `save(path)`, `store()` | Create, load and save the dataset; reach the Oxigraph store underneath |
-| `install_system_graphs()` | Install or refresh `<oxilite:schema>` and `<oxilite:vocabulary>` |
-| `add(role, graph, bytes, format, &AddOptions)` | Load a schema document and register it |
+| `new`, `open(data, registry)`, `save(data)`, `store()`, `registry()` | Create, load and save the dataset; reach the Oxigraph store and the Ladybug registry underneath |
+| `default_registry_path(dataset)` | The `.lbdb` path for a dataset file |
+| `add(role, graph, bytes, format, &AddOptions)` | Load a schema document, register it, and project it as nodes and edges |
 | `register(&SchemaGraph)` | Write a registration as given |
+| `project_graph_content(g)` | (Re)build a graph's nodes and edges; returns counts |
 | `load(graph, bytes, format, replace)` | Load data |
 | `list()`, `is_registered(g)`, `schemas_for(g, role)` | Read the registry; resolve scopes, imports included |
-| `map(g, &targets)`, `set_active(g, bool)`, `unregister(g)`, `drop_graph(g)` | Change registrations |
-| `problems()`, `check_registry()` | Check the registry, without and with SHACL |
+| `map(g, &targets)`, `set_active(g, bool)`, `unregister(g)`, `drop_graph(g)` | Change registrations (`drop_graph` also removes the projection and the triples) |
+| `problems()` | Check the registry structurally |
 | `verify(g, bytes)` | Detect drift |
 | `validate(g, &ValidateOptions)`, `validate_shex(g, shexc, base, map)` | Validate |
-| `query(sparql)`, `update(sparql)` | Plain SPARQL over the dataset |
-| `persist_schema_to_ladybug(&store)`, `load_schema_from_ladybug(&store)` | Persist the schema registry in Ladybug (`LadybugSchemaStore`, `lbug` 0.21+) instead of oxilite's `<oxilite:schema>` graph |
+| `cypher(cypher)` | Run Cypher against the registry; rows of display strings |
 
-The `registry` module holds the store-independent part: `register_update`, `remap_update`, `set_active_update`, `unregister_update`, `drop_update`, `entries_query` with `entries_from_rows`, `problems`, `system_graphs_update`, and `update_touches_registry`, which tells whether a SPARQL update can change the registry. Use them to drive any SPARQL endpoint.
+## 15. Registry schema reference
 
-## 15. Vocabulary reference
+One `SchemaEntry` node per registration (`id` is graph plus role): `graph`, `role`
+(`ontology`, `shacl`, `shex`), `ontologyIri`, `version`, `sha256`, `active`, `loadedAt`,
+and the `appliesTo` / `imports` lists as JSON arrays (empty `appliesTo` is every graph).
 
-Namespace `oxl:` = `https://oxilite.dev/ns#`, version 2.1. The source is [`vocab/oxl.ttl`](../vocab/oxl.ttl), installed in `<oxilite:vocabulary>`.
+Projected content, rebuilt by `add` and `ontobug project`:
 
-| Term | Kind | Meaning |
+| Table | Kind | Properties / meaning |
 |---|---|---|
-| `oxl:RegisteredGraph` | class ⊑ `sd:Graph`; disjoint union of `oxl:SchemaGraph` and `oxl:SystemGraph` | A graph described in the registry; the domain of every registration property |
-| `oxl:SchemaGraph` | class | A named graph holding schema rather than data |
-| `oxl:OntologyGraph` | class ⊑ `oxl:SchemaGraph` | RDFS / OWL axioms |
-| `oxl:ShapesGraph` | class ⊑ `oxl:SchemaGraph` | SHACL shapes |
-| `oxl:ShExGraph` | class ⊑ `oxl:SchemaGraph` | A ShEx schema |
-| `oxl:SystemGraph` | class, disjoint with `oxl:SchemaGraph` | `<oxilite:schema>`, `<oxilite:vocabulary>` |
-| `oxl:GraphTarget` | class | What `oxl:appliesTo` points at |
-| `oxl:appliesTo` | object property | A data graph, `oxl:DefaultGraph` or `oxl:AllGraphs` |
-| `oxl:active` | functional, `xsd:boolean` | An `xsd:boolean` false switches a registration off; absent means true |
-| `oxl:ontologyIri` | functional, IRI | The `owl:Ontology` IRI, when it differs from the graph name |
-| `oxl:version` | functional, string | A pinned version |
-| `oxl:sha256` | functional, string | Lowercase hex SHA-256 of the source document |
-| `oxl:loadedAt` | functional, `xsd:dateTime`, ⊑ `dcterms:date` | When it was registered |
-| `oxl:imports` | IRI | An import recorded in the registry |
-| `oxl:DefaultGraph`, `oxl:AllGraphs` | individuals | The default graph; every graph |
-| `oxl:RegistrationShape` | `sh:NodeShape` | The shape every registration conforms to |
+| `OntologyClass` | node | `iri`, `label`, `comment`, owning `graph`; empty label is a stub: referenced, defined nowhere |
+| `OntologyProperty` | node | `iri`, `kind` (`object`, `datatype`, `annotation`, `property`), `label`, `comment`, `rangeDatatypes` (JSON), `graph` |
+| `ShaclShape` | node | `shape`, `targetClasses` / `targetNodes` / `targetSubjectsOf` / `targetObjectsOf` (JSON), `message`, `severity`, `deactivated`, `graph` |
+| `ShaclProperty` | node | `shapeId`, `path`, `datatype`, `class`, `nodeKind`, `minCount`, `maxCount`, `pattern`, `minInclusive`, `maxInclusive`, `message`, `severity`, `deactivated`, `graph` |
+| `SUBCLASS_OF`, `EQUIVALENT_CLASS` | rel | Class to class |
+| `DOMAIN`, `RANGE` | rel | Property to class |
+| `HAS_CONSTRAINT` | rel | Shape to its property constraints |
+| `TARGETS` | rel | Shape to the classes of its target classes, whatever graph defined them |
+| `ON_PROPERTY` | rel | Constraint to the property of its path |
 
 ## 16. Compatibility and limits
 
-**Compatibility with oxilite.** Ontobug was extracted from [oxilite](https://oxilitedb.com)'s schema registry and writes the same wire format: `oxl:` vocabulary 2.1, `<oxilite:schema>`, `<oxilite:vocabulary>`. You can load a dataset that Ontobug manages into oxilite with `oxilite load --location hr.db --file hr.trig`, and oxilite then uses the registrations for query-time RDFS/OWL-QL reasoning and the shape index. A TriG or N-Quads dump of an oxilite store (`Store::dump_to_writer`) opens in Ontobug the same way. The graph and namespace IRIs stay as they are for that reason.
+**Origin.** Ontobug began as the schema registry of [oxilite](https://oxilitedb.com)
+(SPARQL on SQLite). The registry has since moved to [Ladybug](https://ladybugdb.com):
+registrations are `SchemaEntry` nodes queried with Cypher, and there is no oxilite wire
+compatibility anymore. RDF content stays standard TriG/N-Quads, so any SHACL processor
+still validates it ([§13](#13-using-another-shacl-processor)).
 
 **Limits:**
 
-- **Storage.** The dataset is held in memory and saved to one TriG/N-Quads file. For large datasets, use the `registry` SPARQL builders against a real store (Oxigraph, oxilite, any SPARQL 1.1 endpoint), or validate with oxilite.
+- **Storage.** RDF content is held in memory and saved to one TriG/N-Quads file; the
+registry and the projected schemas live in a Ladybug `.lbdb` database.
+- **Projection is one-way.** Ladybug mirrors the RDF graphs for querying; validation
+still reads RDF. Edit the documents, `add` them again, and the projection rebuilds.
 - **No OWL reasoner.** Ontologies take part in validation through class membership only (§8.3). Ontobug checks neither OWL consistency nor property characteristics.
 - **No fetching.** Imports resolve only against registered ontologies.
-- **No blank-node graphs.** A graph named by a blank node cannot be registered, because another graph cannot name it.
-- **Shared description.** The roles of one graph share one description: targets, active flag and version.
+- **No blank-node graphs.** A graph named by a blank node cannot be registered, because no other graph can name it.
+- **Projection limits.** Complex SHACL paths (`sh:inversePath` aside) are stored as written, and `sh:in` / `sh:node` references are not followed.
 - **SHACL coverage** is rudof's: SHACL Core. Check rudof's documentation for SHACL-SPARQL and newer features.

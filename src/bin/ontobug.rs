@@ -145,6 +145,9 @@ enum Command {
     },
     /// Run Cypher against the schema registry, printing rows as TSV.
     Cypher { cypher: String },
+    /// (Re)build a registered graph's Ladybug nodes and edges from its RDF content.
+    /// `add` already does this for ontology and shapes graphs.
+    Project { graph: String },
     /// Print the dataset as TriG, or one graph as N-Triples.
     Export { graph: Option<String> },
 }
@@ -417,11 +420,24 @@ fn run(cli: Cli) -> ontobug::Result<ExitCode> {
                 println!("{}", row.join("\t"));
             }
         }
+        Command::Project { graph } => {
+            let g = parse_graph(&graph)?;
+            let p = c.project_graph_content(g.as_ref())?;
+            println!(
+                "projected {}: {} classes, {} properties, {} edges, {} shapes, {} constraints, {} links",
+                graph_label(&g),
+                p.classes,
+                p.properties,
+                p.edges,
+                p.shapes,
+                p.constraints,
+                p.links
+            );
+        }
         Command::Export { graph } => match graph {
             Some(g) => print!("{}", c.graph_ntriples(parse_graph(&g)?.as_ref())?),
             None => {
-                let tmp =
-                    std::env::temp_dir().join(format!("ontobug-{}.trig", std::process::id()));
+                let tmp = std::env::temp_dir().join(format!("ontobug-{}.trig", std::process::id()));
                 c.save(&tmp)?;
                 print!("{}", std::fs::read_to_string(&tmp)?);
                 std::fs::remove_file(&tmp)?;
