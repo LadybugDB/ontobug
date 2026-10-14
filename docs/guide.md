@@ -1,31 +1,31 @@
-# Ontolith guide
+# Ontobug guide
 
 How to keep OWL ontologies, SHACL shapes and ShEx schemas next to your data in one RDF dataset, say which schema governs which data, and validate data graphs against them.
 
-Every example below is runnable: the files are in [`examples/hr`](../examples/hr), and the outputs are the ones Ontolith prints.
+Every example below is runnable: the files are in [`examples/hr`](../examples/hr), and the outputs are the ones Ontobug prints.
 
 - [1. Concepts](#1-concepts)
 - [2. Install and first run](#2-install-and-first-run)
-- [3. The registry graph](#3-the-registry-graph)
+- [3. The registry (Ladybug)](#3-the-registry-ladybug)
 - [4. Adding an OWL ontology](#4-adding-an-owl-ontology)
 - [5. Imports between ontologies](#5-imports-between-ontologies)
 - [6. Adding SHACL shapes](#6-adding-shacl-shapes)
 - [7. Mapping schemas to data graphs](#7-mapping-schemas-to-data-graphs)
 - [8. Validating a graph with SHACL](#8-validating-a-graph-with-shacl)
 - [9. Validating with ShEx](#9-validating-with-shex)
-- [10. Validating the registry itself](#10-validating-the-registry-itself)
+- [10. Checking the registry](#10-checking-the-registry)
 - [11. Lifecycle: versions, drift, deactivation, removal](#11-lifecycle-versions-drift-deactivation-removal)
-- [12. SPARQL recipes for any store](#12-sparql-recipes-for-any-store)
+- [12. Cypher recipes](#12-cypher-recipes)
 - [13. Using another SHACL processor](#13-using-another-shacl-processor)
 - [14. Rust API](#14-rust-api)
-- [15. Vocabulary reference](#15-vocabulary-reference)
+- [15. Registry schema reference](#15-registry-schema-reference)
 - [16. Compatibility and limits](#16-compatibility-and-limits)
 
 ---
 
 ## 1. Concepts
 
-A **dataset** is a set of named graphs. Ontolith gives each graph a job:
+A **dataset** is a set of named graphs. Ontobug gives each graph a job:
 
 | Kind of graph | Holds | Example |
 |---|---|---|
@@ -33,25 +33,27 @@ A **dataset** is a set of named graphs. Ontolith gives each graph a job:
 | **Ontology graph** | RDFS / OWL axioms: classes, properties, hierarchies | `<https://example.org/onto/hr>` |
 | **Shapes graph** | SHACL shapes: constraints on the data | `<https://example.org/shapes/hr>` |
 | **ShEx graph** | A ShEx schema | `<https://example.org/shex/hr>` |
-| **Registry graph** | One description per schema graph | `<oxilite:schema>` |
-| **Vocabulary graph** | The `oxl:` vocabulary and the registry's own shapes | `<oxilite:vocabulary>` |
+| **Registry** | One `SchemaEntry` node per schema graph, in Ladybug | `MATCH (e:SchemaEntry) RETURN e.graph, e.role` |
 
-The **registry** is plain RDF. It records, for each schema graph:
+The **registry** lives in Ladybug. It records, for each schema graph:
 
 - its **role**: ontology, SHACL or ShEx;
 - the data graphs it **applies to**, or all graphs;
 - whether it is **active**;
 - the ontology IRI, a pinned **version**, the **SHA-256** of the file it came from, **imports**, and when it was loaded.
 
-Because the registry is data, it travels with the dataset. You can query and change it with plain SPARQL, and any SHACL processor can check it.
+Because the registry is a property graph, you query and change it with Cypher — `ontobug cypher` runs it, or use any Ladybug client against the `.lbdb` file.
 
 ```
-             ┌──────────────── <oxilite:schema> (registry) ─────────────────┐
-             │ onto/core  a OntologyGraph ; appliesTo data/other            │
-             │ onto/hr    a OntologyGraph ; appliesTo data/staff ;          │
-             │            ontologyIri hr# ;  (hr# owl:imports core#)        │
-             │ shapes/hr  a ShapesGraph   ; appliesTo data/staff            │
-             └──────────────────────────────────────────────────────────────┘
+             ┌────────────────── Ladybug registry ──────────────────┐
+             │ (:SchemaEntry {graph: onto/core,  role: ontology,   │
+             │                 appliesTo: [data/other]})           │
+             │ (:SchemaEntry {graph: onto/hr,    role: ontology,   │
+             │                 appliesTo: [data/staff],            │
+             │                 ontologyIri: hr#})                  │
+             │ (:SchemaEntry {graph: shapes/hr, role: shacl,       │
+             │                 appliesTo: [data/staff]})           │
+             └─────────────────────────────────────────────────────┘
                      │ scope of data/staff = hr + core (import) + shapes/hr
                      ▼
    data/staff ──validate──▶ SHACL engine (rudof) ──▶ report
@@ -62,75 +64,55 @@ Registering a graph never moves, copies or rewrites its triples. The registry on
 ## 2. Install and first run
 
 ```sh
-git clone <this repo> ontolith && cd ontolith
-cargo install --path .          # installs the `ontolith` binary
+git clone <this repo> ontobug && cd ontobug
+cargo install --path .          # installs the `ontobug` binary
 ```
 
-Every command works on one dataset file, given with `--dataset` (`-d`) or `ONTOLITH_DATASET`; it defaults to `dataset.trig`. The file is TriG (`.trig`) or N-Quads (`.nq`), and it is created when missing. Each command that changes something rewrites the file atomically.
+Every command works on one dataset: RDF content in a file, given with `--dataset` (`-d`) or `ONTOBUG_DATASET` (default `dataset.trig`; TriG or N-Quads, created when missing), and the registry in a Ladybug database, given with `--ladybug` (`-l`) or `ONTOBUG_LADYBUG` (default: the dataset stem with `.lbdb`, so `hr.trig` goes with `hr.lbdb`). Each command that changes RDF rewrites the content file atomically; the registry needs no saving, Ladybug persists it as it changes.
 
 The whole HR walkthrough in one go:
 
 ```sh
 cd examples/hr
-export ONTOLITH_DATASET=hr.trig
+export ONTOBUG_DATASET=hr.trig
+# …which puts the registry in hr.lbdb next to it.
 
-ontolith init
-ontolith add ontology https://example.org/onto/core --file core.ttl \
+ontobug add ontology https://example.org/onto/core --file core.ttl \
     --applies-to https://example.org/data/other
-ontolith add ontology https://example.org/onto/hr --file hr.ttl \
+ontobug add ontology https://example.org/onto/hr --file hr.ttl \
     -t https://example.org/data/staff -t https://example.org/data/staff-broken
-ontolith add shacl https://example.org/shapes/hr --file hr-shapes.ttl \
+ontobug add shacl https://example.org/shapes/hr --file hr-shapes.ttl \
     -t https://example.org/data/staff -t https://example.org/data/staff-broken
-ontolith load https://example.org/data/staff        --file staff.ttl
-ontolith load https://example.org/data/staff-broken --file staff-broken.ttl
+ontobug load https://example.org/data/staff        --file staff.ttl
+ontobug load https://example.org/data/staff-broken --file staff-broken.ttl
 
-ontolith list
-ontolith validate https://example.org/data/staff          # conforms: yes, exit 0
-ontolith validate https://example.org/data/staff-broken   # 10 violations, exit 1
+ontobug list
+ontobug validate https://example.org/data/staff          # conforms: yes, exit 0
+ontobug validate https://example.org/data/staff-broken   # 10 violations, exit 1
 ```
 
 Graph arguments take an IRI, or `DEFAULT` for the default graph. In `--applies-to` and `map --to`, `ALL` means every graph.
 
-## 3. The registry graph
+## 3. The registry (Ladybug)
 
-After the walkthrough, `ontolith export` prints the registry graph like this (timestamps and digests will differ):
+After the walkthrough, the registry holds one `SchemaEntry` node per registration:
 
-```trig
-PREFIX oxl: <https://oxilite.dev/ns#>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+```sh
+$ ontobug list
+ontology active   <https://example.org/onto/hr> -> <https://example.org/data/staff> <https://example.org/data/staff-broken>  version=https://example.org/hr/2.1.0  ontology=<https://example.org/hr#>
+shacl    active   <https://example.org/shapes/hr> -> <https://example.org/data/staff> <https://example.org/data/staff-broken>
 
-<oxilite:schema> {
-  <https://example.org/onto/core> a oxl:OntologyGraph ;
-      oxl:active true ;
-      oxl:appliesTo <https://example.org/data/other> ;
-      oxl:ontologyIri <https://example.org/core#> ;
-      oxl:version "1.0.0" ;
-      oxl:sha256 "658695ac5776e2c017455598ff9692c34e8c140496362bb3bdc4f10611fd35d8" ;
-      oxl:loadedAt "2026-10-13T07:26:42.43349Z"^^xsd:dateTime .
-
-  <https://example.org/onto/hr> a oxl:OntologyGraph ;
-      oxl:active true ;
-      oxl:appliesTo <https://example.org/data/staff> , <https://example.org/data/staff-broken> ;
-      oxl:ontologyIri <https://example.org/hr#> ;
-      oxl:version "https://example.org/hr/2.1.0" ;
-      oxl:sha256 "1aae19e3014a5c35f13f0759c3b3670b1add379a3e4a0f25ccc1e74d54c08abb" ;
-      oxl:loadedAt "2026-10-13T07:26:42.44659Z"^^xsd:dateTime .
-
-  <https://example.org/shapes/hr> a oxl:ShapesGraph ;
-      oxl:active true ;
-      oxl:appliesTo <https://example.org/data/staff> , <https://example.org/data/staff-broken> ;
-      oxl:sha256 "f2a7e4041fd98b6efccf1243054d6cf63920c5229b010dab4fa5516c8d3bad62" ;
-      oxl:loadedAt "2026-10-13T07:28:36.750035Z"^^xsd:dateTime .
-
-  # The two system graphs describe themselves.
-  <oxilite:schema>     a oxl:SystemGraph ; rdfs:label "schema registry" .
-  <oxilite:vocabulary> a oxl:SystemGraph ; rdfs:label "oxilite vocabulary" ;
-      oxl:appliesTo <oxilite:schema> ; oxl:ontologyIri oxl: ; oxl:version "2.1" .
-}
+$ ontobug cypher "MATCH (e:SchemaEntry) RETURN e.graph, e.role, e.appliesTo, e.version, e.active ORDER BY e.graph, e.role"
+https://example.org/onto/core\tontology\t["https://example.org/data/other"]\t1.0.0\tTrue
+https://example.org/onto/hr\tontology\t["https://example.org/data/staff","https://example.org/data/staff-broken"]\thttps://example.org/hr/2.1.0\tTrue
+https://example.org/shapes/hr\tshacl\t["https://example.org/data/staff","https://example.org/data/staff-broken"]\t\tTrue
 ```
 
-The subject of each description is **the schema graph's own name**. The schema's content stays in that graph:
+Each node carries the registration: `graph`, `role` (`ontology`, `shacl` or `shex`),
+`ontologyIri`, `version`, `sha256`, `active`, `loadedAt`, and the `appliesTo` and
+`imports` lists as JSON arrays. An empty `appliesTo` means every graph.
+
+The schema's content stays in its RDF graph; the registry only describes it:
 
 ```trig
 <https://example.org/onto/hr> {
@@ -140,33 +122,20 @@ The subject of each description is **the schema graph's own name**. The schema's
 }
 ```
 
-**Canonical and short forms.** Ontolith always writes `oxl:active` as an `xsd:boolean` and at least one `oxl:appliesTo` (`oxl:AllGraphs` for "every graph"). It also reads the short forms, so a hand-written registry can leave both out:
+**One graph, several roles.** An ontology that carries its own SHACL shapes gets one node
+per role, so scoping counts it once per role. `ontobug add` writes one role; register the
+same graph again with another role to add the second:
 
-```trig
-<oxilite:schema> {
-  # No oxl:active: active. No oxl:appliesTo: applies to every graph.
-  <https://example.org/shapes/common> a oxl:ShapesGraph .
-}
+```sh
+ontobug add ontology https://example.org/onto/hr --file hr.ttl -t https://example.org/data/staff
+ontobug add shacl    https://example.org/onto/hr --file hr-shapes.ttl -t https://example.org/data/staff
 ```
-
-Only an `xsd:boolean` false deactivates: `false` or `"0"^^xsd:boolean`. A plain string `"false"` is invalid. Readers ignore it, and `ontolith check` reports it.
-
-**One graph, several roles.** An ontology that carries its own SHACL shapes is typed with both classes. It is then listed once per role, and both roles share one description:
-
-```trig
-<oxilite:schema> {
-  <https://example.org/onto/hr> a oxl:OntologyGraph , oxl:ShapesGraph ;
-      oxl:appliesTo oxl:AllGraphs .
-}
-```
-
-`ontolith add` writes one role and replaces the whole description. To give a graph a second role, add the type with `ontolith update` (see [§12](#12-sparql-recipes-for-any-store)).
 
 ## 4. Adding an OWL ontology
 
 ### 4.1 Write the ontology
 
-Any RDFS or OWL document works: Turtle, N-Triples, RDF/XML (`.rdf`, `.owl`), N3. Give it an `owl:Ontology` header. Ontolith reads the IRI and version from it. [`examples/hr/core.ttl`](../examples/hr/core.ttl):
+Any RDFS or OWL document works: Turtle, N-Triples, RDF/XML (`.rdf`, `.owl`), N3. Give it an `owl:Ontology` header. Ontobug reads the IRI and version from it. [`examples/hr/core.ttl`](../examples/hr/core.ttl):
 
 ```turtle
 @prefix core: <https://example.org/core#> .
@@ -222,7 +191,7 @@ hr:hireDate a owl:DatatypeProperty , owl:FunctionalProperty ;
 ### 4.2 Register it
 
 ```sh
-$ ontolith add ontology https://example.org/onto/hr --file hr.ttl \
+$ ontobug add ontology https://example.org/onto/hr --file hr.ttl \
       -t https://example.org/data/staff -t https://example.org/data/staff-broken
 registered <https://example.org/onto/hr> (41 triples)
 ontology active   <https://example.org/onto/hr> -> <https://example.org/data/staff-broken> <https://example.org/data/staff>  version=https://example.org/hr/2.1.0  ontology=<https://example.org/hr#>
@@ -244,13 +213,13 @@ Options:
 | `--import IRI` | Record an import in the registry (`oxl:imports`); repeatable |
 | `--inactive` | Register it switched off |
 
-**Naming the graph.** The graph name and the ontology IRI can be the same (`ontolith add ontology https://example.org/hr# …`). A separate graph name such as `…/onto/hr` lets you load two versions of one ontology side by side, as `…/onto/hr/2.0` and `…/onto/hr/2.1`.
+**Naming the graph.** The graph name and the ontology IRI can be the same (`ontobug add ontology https://example.org/hr# …`). A separate graph name such as `…/onto/hr` lets you load two versions of one ontology side by side, as `…/onto/hr/2.0` and `…/onto/hr/2.1`.
 
-### 4.3 What an ontology does in Ontolith
+### 4.3 What an ontology does in Ontobug
 
-During SHACL validation, the ontologies in scope for a data graph join the data graph. Ontolith also writes out the `rdf:type` triples they entail through `rdfs:subClassOf` and `owl:equivalentClass`. That is what makes `sh:targetClass core:Person` reach an `hr:Manager` (see [§8.3](#83-why-ontologies-take-part-in-validation)).
+During SHACL validation, the ontologies in scope for a data graph join the data graph. Ontobug also writes out the `rdf:type` triples they entail through `rdfs:subClassOf` and `owl:equivalentClass`. That is what makes `sh:targetClass core:Person` reach an `hr:Manager` (see [§8.3](#83-why-ontologies-take-part-in-validation)).
 
-Ontolith does not run a full OWL reasoner and does not check OWL consistency. To use the ontologies for query-time reasoning, open the dataset in [oxilite](https://oxilitedb.com), which reads the same registry and scopes RDFS/OWL-QL reasoning per data graph. You can also export the graphs to an OWL reasoner.
+Ontobug does not run a full OWL reasoner and does not check OWL consistency. To use the ontologies for query-time reasoning, open the dataset in [oxilite](https://oxilitedb.com), which reads the same registry and scopes RDFS/OWL-QL reasoning per data graph. You can also export the graphs to an OWL reasoner.
 
 ## 5. Imports between ontologies
 
@@ -265,7 +234,7 @@ An ontology's scope includes the **active, registered** ontologies it imports, t
 **What an import matches:** a registered ontology's graph name, or its `oxl:ontologyIri`. `hr.ttl` imports `<https://example.org/core#>`. That is the `oxl:ontologyIri` of the graph `<https://example.org/onto/core>`, so core joins the scope:
 
 ```sh
-$ ontolith scope https://example.org/data/staff
+$ ontobug scope https://example.org/data/staff
 ontology <https://example.org/onto/hr>
 ontology <https://example.org/onto/core>
 shacl    <https://example.org/shapes/hr>
@@ -276,14 +245,14 @@ Core itself applies only to `data/other`. It reaches `data/staff` only through t
 **What an import does not do:** fetch anything from the web. An import that matches no registered ontology is recorded and ignored. Load and register the imported ontology yourself:
 
 ```sh
-ontolith add ontology http://xmlns.com/foaf/0.1/ --file foaf.rdf -t https://example.org/data/other
+ontobug add ontology http://xmlns.com/foaf/0.1/ --file foaf.rdf -t https://example.org/data/other
 ```
 
 **An inactive ontology is never imported:**
 
 ```sh
-$ ontolith deactivate https://example.org/onto/core
-$ ontolith scope https://example.org/data/staff
+$ ontobug deactivate https://example.org/onto/core
+$ ontobug scope https://example.org/data/staff
 ontology <https://example.org/onto/hr>
 shacl    <https://example.org/shapes/hr>
 ```
@@ -388,17 +357,17 @@ hrsh:ManagerShape a sh:NodeShape ;
 ### 6.3 Register them
 
 ```sh
-$ ontolith add shacl https://example.org/shapes/hr --file hr-shapes.ttl \
+$ ontobug add shacl https://example.org/shapes/hr --file hr-shapes.ttl \
       -t https://example.org/data/staff -t https://example.org/data/staff-broken
 registered <https://example.org/shapes/hr> (38 triples)
 shacl    active   <https://example.org/shapes/hr> -> <https://example.org/data/staff-broken> <https://example.org/data/staff>
 ```
 
-Several shapes graphs can apply to one data graph: Ontolith validates against their union. A common setup is one organisation-wide shapes graph applied to every graph, plus a stricter one per dataset:
+Several shapes graphs can apply to one data graph: Ontobug validates against their union. A common setup is one organisation-wide shapes graph applied to every graph, plus a stricter one per dataset:
 
 ```sh
-ontolith add shacl https://example.org/shapes/common --file common.ttl            # every graph
-ontolith add shacl https://example.org/shapes/payroll --file payroll.ttl -t https://example.org/data/payroll
+ontobug add shacl https://example.org/shapes/common --file common.ttl            # every graph
+ontobug add shacl https://example.org/shapes/payroll --file payroll.ttl -t https://example.org/data/payroll
 ```
 
 ## 7. Mapping schemas to data graphs
@@ -411,8 +380,8 @@ ontolith add shacl https://example.org/shapes/payroll --file payroll.ttl -t http
 Change only the targets, keeping roles, version and everything else:
 
 ```sh
-ontolith map https://example.org/shapes/hr --to https://example.org/data/staff DEFAULT
-ontolith map https://example.org/shapes/hr --to ALL
+ontobug map https://example.org/shapes/hr --to https://example.org/data/staff DEFAULT
+ontobug map https://example.org/shapes/hr --to ALL
 ```
 
 Per-graph mapping lets conflicting schemas live side by side:
@@ -432,7 +401,7 @@ Here a `ex:Dog` in the zoo graph is read with the zoo and common ontologies. A `
 ### 8.1 Run it
 
 ```sh
-$ ontolith validate https://example.org/data/staff
+$ ontobug validate https://example.org/data/staff
 data:       <https://example.org/data/staff>
 shapes:     <https://example.org/shapes/hr>
 ontologies: <https://example.org/onto/hr> <https://example.org/onto/core>
@@ -458,7 +427,7 @@ ex:globex core:name "Globex" .
 ```
 
 ```sh
-$ ontolith validate https://example.org/data/staff-broken
+$ ontobug validate https://example.org/data/staff-broken
 data:       <https://example.org/data/staff-broken>
 shapes:     <https://example.org/shapes/hr>
 ontologies: <https://example.org/onto/hr> <https://example.org/onto/core>
@@ -500,7 +469,7 @@ Each line is one SHACL validation result: severity, focus node, path, the offend
 **Exit codes:** `0` the graph conforms, `1` it does not, `2` an error (bad arguments, unreadable shapes, no shapes in scope). That makes `validate` usable as a CI gate:
 
 ```sh
-ontolith -d release.trig validate https://example.org/data/staff --output json > report.json
+ontobug -d release.trig validate https://example.org/data/staff --output json > report.json
 ```
 
 ```json
@@ -532,13 +501,13 @@ For a data graph `D`:
 3. **Data graph:** `D`'s triples, plus the ontologies' triples, plus the `rdf:type` triples they entail (see §8.3).
 4. **Engine:** [rudof](https://rudof-project.github.io/)'s native SHACL engine. `--sparql` uses its SPARQL-based engine instead.
 
-`ontolith scope D` prints steps 1 and 2 without validating.
+`ontobug scope D` prints steps 1 and 2 without validating.
 
 ### 8.3 Why ontologies take part in validation
 
 The SHACL spec defines "instance of `C`" through `rdf:type/rdfs:subClassOf*` **in the data graph**. A shape with `sh:targetClass core:Person` must therefore check every `hr:Manager`, but only if the data graph knows that `hr:Manager rdfs:subClassOf hr:Employee` and `hr:Employee rdfs:subClassOf core:Person`. Those axioms live in the ontology graphs, not in the data.
 
-So Ontolith adds the ontologies in scope to the data graph. It also writes out the entailed types: for every `?x a ?c` with `?c (rdfs:subClassOf|owl:equivalentClass|^owl:equivalentClass)+ ?super`, it adds `?x a ?super`. Every engine then agrees, whatever its own class index does.
+So Ontobug adds the ontologies in scope to the data graph. It also writes out the entailed types: for every `?x a ?c` with `?c (rdfs:subClassOf|owl:equivalentClass|^owl:equivalentClass)+ ?super`, it adds `?x a ?super`. Every engine then agrees, whatever its own class index does.
 
 Compare the two runs on `staff-broken`:
 
@@ -555,7 +524,7 @@ Only class membership is entailed. Domains and ranges are not applied. If they w
 ### 8.4 Validating from Rust
 
 ```rust
-use ontolith::{Catalog, ValidateOptions, parse_graph};
+use ontobug::{Catalog, ValidateOptions, parse_graph};
 
 let catalog = Catalog::open("hr.trig")?;
 let v = catalog.validate(
@@ -594,7 +563,7 @@ PREFIX :     <https://example.org/hr/shex#>
 ```
 
 ```sh
-$ ontolith shex https://example.org/data/staff --schema person.shex \
+$ ontobug shex https://example.org/data/staff --schema person.shex \
     --map '<https://example.org/people/bob>@<https://example.org/hr/shex#Employee>,<https://example.org/people/acme>@<https://example.org/hr/shex#Employee>'
 FAIL https://example.org/people/acme@https://example.org/hr/shex#Employee
     Shape :Employee failed for node <https://example.org/people/acme>: no candidates matched the expression
@@ -602,7 +571,7 @@ FAIL https://example.org/people/acme@https://example.org/hr/shex#Employee
 ok   https://example.org/people/bob@https://example.org/hr/shex#Employee
 ```
 
-The exit code is `1` when any node fails. To keep a ShEx schema in the dataset, register its RDF form (ShExR, in Turtle for example) with `ontolith add shex …`. It is then recorded and mapped like the other roles. The `shex` command reads the ShExC text from `--schema`.
+The exit code is `1` when any node fails. To keep a ShEx schema in the dataset, register its RDF form (ShExR, in Turtle for example) with `ontobug add shex …`. It is then recorded and mapped like the other roles. The `shex` command reads the ShExC text from `--schema`.
 
 ## 10. Validating the registry itself
 
@@ -628,15 +597,15 @@ oxl:RegistrationShape a sh:NodeShape ;
     .
 ```
 
-`ontolith check` runs two checks: a plain Rust check of the same constraints, which needs no SHACL engine, and the SHACL shape itself through rudof. Break the registry on purpose:
+`ontobug check` runs two checks: a plain Rust check of the same constraints, which needs no SHACL engine, and the SHACL shape itself through rudof. Break the registry on purpose:
 
 ```sh
-$ ontolith update 'PREFIX oxl: <https://oxilite.dev/ns#>
+$ ontobug update 'PREFIX oxl: <https://oxilite.dev/ns#>
     INSERT DATA { GRAPH <oxilite:schema> {
       <https://example.org/onto/hr> oxl:active "no" ; oxl:sha256 "ABC" .
       <https://example.org/x> oxl:appliesTo oxl:AllGraphs } }'
 
-$ ontolith check
+$ ontobug check
 <https://example.org/onto/hr>: <https://oxilite.dev/ns#active> has 2 values, at most one is allowed
 <https://example.org/onto/hr>: <https://oxilite.dev/ns#sha256> has 2 values, at most one is allowed
 <https://example.org/onto/hr>: <https://oxilite.dev/ns#active> "no" is not an <http://www.w3.org/2001/XMLSchema#boolean>
@@ -656,9 +625,9 @@ The two checks find the same five problems, and the exit code is `1`. Readers st
 **Drift detection.** `add` records the file's SHA-256. `verify` compares the file you have now with that digest:
 
 ```sh
-$ ontolith verify https://example.org/onto/hr --file hr.ttl
+$ ontobug verify https://example.org/onto/hr --file hr.ttl
 unchanged
-$ ontolith verify https://example.org/onto/hr --file hr-edited.ttl
+$ ontobug verify https://example.org/onto/hr --file hr-edited.ttl
 changed: recorded 1aae19e3…, file 658695ac…        # exit 1
 ```
 
@@ -667,12 +636,12 @@ To pick up the change, run `add` again: it reloads the graph and rewrites the de
 **Upgrading an ontology.** Load the new version into its own graph, switched off, so both versions stay in the dataset. Then swap them, validate, and swap back if the data does not fit:
 
 ```sh
-ontolith add ontology https://example.org/onto/hr/2.2 --file hr-2.2.ttl --inactive \
+ontobug add ontology https://example.org/onto/hr/2.2 --file hr-2.2.ttl --inactive \
     -t https://example.org/data/staff
-ontolith deactivate https://example.org/onto/hr        # still registered, contributes nothing
-ontolith activate   https://example.org/onto/hr/2.2
-ontolith validate https://example.org/data/staff \
-  || { ontolith deactivate https://example.org/onto/hr/2.2; ontolith activate https://example.org/onto/hr; }
+ontobug deactivate https://example.org/onto/hr        # still registered, contributes nothing
+ontobug activate   https://example.org/onto/hr/2.2
+ontobug validate https://example.org/data/staff \
+  || { ontobug deactivate https://example.org/onto/hr/2.2; ontobug activate https://example.org/onto/hr; }
 ```
 
 **Deactivate or remove:**
@@ -688,7 +657,7 @@ ontolith validate https://example.org/data/staff \
 
 ## 12. SPARQL recipes for any store
 
-These are the exact updates Ontolith runs (`ontolith::registry::*_update`). They work unchanged with `ontolith update`, on Oxigraph, on oxilite, or on any SPARQL 1.1 store.
+These are the exact updates Ontobug runs (`ontobug::registry::*_update`). They work unchanged with `ontobug update`, on Oxigraph, on oxilite, or on any SPARQL 1.1 store.
 
 Register an ontology for two graphs, replacing any earlier description:
 
@@ -740,7 +709,7 @@ DELETE WHERE { GRAPH <oxilite:schema> { <https://ex.org/onto/hr> ?p ?o } } ;
 DROP SILENT GRAPH <https://ex.org/onto/hr>
 ```
 
-Find the active shapes graphs for a data graph. `?a = false` compares values, so `"0"^^xsd:boolean` matches and a plain `"false"` does not, just as Ontolith reads it:
+Find the active shapes graphs for a data graph. `?a = false` compares values, so `"0"^^xsd:boolean` matches and a plain `"false"` does not, just as Ontobug reads it:
 
 ```sparql
 PREFIX oxl: <https://oxilite.dev/ns#>
@@ -765,7 +734,7 @@ SELECT ?s ?p ?o WHERE {
 }
 ```
 
-Derive `sh:shapesGraph` for a SHACL tool that expects it. It is the reverse of `oxl:appliesTo`, and Ontolith does not store it, so the two cannot drift apart:
+Derive `sh:shapesGraph` for a SHACL tool that expects it. It is the reverse of `oxl:appliesTo`, and Ontobug does not store it, so the two cannot drift apart:
 
 ```sparql
 PREFIX oxl: <https://oxilite.dev/ns#>
@@ -782,13 +751,13 @@ WHERE { GRAPH <oxilite:schema> {
 
 ## 13. Using another SHACL processor
 
-The dataset is standard RDF, so any SHACL processor can validate it. Export the graphs that `ontolith scope` names:
+The dataset is standard RDF, so any SHACL processor can validate it. Export the graphs that `ontobug scope` names:
 
 ```sh
-ontolith export https://example.org/data/staff-broken > data.nt
-ontolith export https://example.org/shapes/hr        > shapes.nt
-ontolith export https://example.org/onto/hr          > hr.nt
-ontolith export https://example.org/onto/core        > core.nt
+ontobug export https://example.org/data/staff-broken > data.nt
+ontobug export https://example.org/shapes/hr        > shapes.nt
+ontobug export https://example.org/onto/hr          > hr.nt
+ontobug export https://example.org/onto/core        > core.nt
 ```
 
 **pySHACL.** `-e` adds an ontology to the data graph, and `-i rdfs` turns on RDFS inference:
@@ -808,7 +777,7 @@ shacl validate --shapes shapes.nt --data data+ontologies.nt
 Validate the registry itself with `vocab/oxl.ttl` as the shapes graph:
 
 ```sh
-ontolith export oxilite:schema > registry.nt
+ontobug export oxilite:schema > registry.nt
 pyshacl -s vocab/oxl.ttl -f human registry.nt
 ```
 
@@ -816,12 +785,12 @@ pyshacl -s vocab/oxl.ttl -f human registry.nt
 
 ```toml
 [dependencies]
-ontolith = { git = "…", default-features = false }   # no CLI dependencies
+ontobug = { git = "…", default-features = false }   # no CLI dependencies
 ```
 
 ```rust
-use ontolith::oxigraph::io::RdfFormat;
-use ontolith::{AddOptions, Catalog, SchemaRole, ValidateOptions, parse_graph, parse_targets};
+use ontobug::oxigraph::io::RdfFormat;
+use ontobug::{AddOptions, Catalog, SchemaRole, ValidateOptions, parse_graph, parse_targets};
 
 let c = Catalog::open("hr.trig")?;          // or Catalog::new() for an empty in-memory dataset
 c.install_system_graphs()?;
@@ -857,6 +826,7 @@ c.save("hr.trig")?;
 | `verify(g, bytes)` | Detect drift |
 | `validate(g, &ValidateOptions)`, `validate_shex(g, shexc, base, map)` | Validate |
 | `query(sparql)`, `update(sparql)` | Plain SPARQL over the dataset |
+| `persist_schema_to_ladybug(&store)`, `load_schema_from_ladybug(&store)` | Persist the schema registry in Ladybug (`LadybugSchemaStore`, `lbug` 0.21+) instead of oxilite's `<oxilite:schema>` graph |
 
 The `registry` module holds the store-independent part: `register_update`, `remap_update`, `set_active_update`, `unregister_update`, `drop_update`, `entries_query` with `entries_from_rows`, `problems`, `system_graphs_update`, and `update_touches_registry`, which tells whether a SPARQL update can change the registry. Use them to drive any SPARQL endpoint.
 
@@ -885,12 +855,12 @@ Namespace `oxl:` = `https://oxilite.dev/ns#`, version 2.1. The source is [`vocab
 
 ## 16. Compatibility and limits
 
-**Compatibility with oxilite.** Ontolith was extracted from [oxilite](https://oxilitedb.com)'s schema registry and writes the same wire format: `oxl:` vocabulary 2.1, `<oxilite:schema>`, `<oxilite:vocabulary>`. You can load a dataset that Ontolith manages into oxilite with `oxilite load --location hr.db --file hr.trig`, and oxilite then uses the registrations for query-time RDFS/OWL-QL reasoning and the shape index. A TriG or N-Quads dump of an oxilite store (`Store::dump_to_writer`) opens in Ontolith the same way. The graph and namespace IRIs stay as they are for that reason.
+**Compatibility with oxilite.** Ontobug was extracted from [oxilite](https://oxilitedb.com)'s schema registry and writes the same wire format: `oxl:` vocabulary 2.1, `<oxilite:schema>`, `<oxilite:vocabulary>`. You can load a dataset that Ontobug manages into oxilite with `oxilite load --location hr.db --file hr.trig`, and oxilite then uses the registrations for query-time RDFS/OWL-QL reasoning and the shape index. A TriG or N-Quads dump of an oxilite store (`Store::dump_to_writer`) opens in Ontobug the same way. The graph and namespace IRIs stay as they are for that reason.
 
 **Limits:**
 
 - **Storage.** The dataset is held in memory and saved to one TriG/N-Quads file. For large datasets, use the `registry` SPARQL builders against a real store (Oxigraph, oxilite, any SPARQL 1.1 endpoint), or validate with oxilite.
-- **No OWL reasoner.** Ontologies take part in validation through class membership only (§8.3). Ontolith checks neither OWL consistency nor property characteristics.
+- **No OWL reasoner.** Ontologies take part in validation through class membership only (§8.3). Ontobug checks neither OWL consistency nor property characteristics.
 - **No fetching.** Imports resolve only against registered ontologies.
 - **No blank-node graphs.** A graph named by a blank node cannot be registered, because another graph cannot name it.
 - **Shared description.** The roles of one graph share one description: targets, active flag and version.

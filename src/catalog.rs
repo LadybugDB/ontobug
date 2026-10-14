@@ -2,24 +2,27 @@
 //! named graphs, register and map the schemas, resolve imports, and validate data graphs
 //! against the shapes that apply to them.
 //!
-//! The dataset is an in-memory Oxigraph store, loaded from and saved to a TriG or N-Quads file.
-//! Every registry operation is the portable SPARQL of [`crate::registry`].
+//! Graph content (RDF triples) lives in an Oxigraph store, loaded from and saved to a TriG
+//! or N-Quads file. The registry — which graph holds which kind of schema and which data
+//! graphs each one governs — lives in Ladybug (see [`crate::ladybug`]) and speaks Cypher,
+//! not SPARQL: [`Catalog::cypher`] runs Cypher against it. Content inspection (ontology
+//! headers, `owl:imports`, triple counts, the subclass closure for validation) reads the
+//! store directly, without a query language.
 
 use crate::error::{Error, Result};
-use crate::registry::{self, vocab, SchemaGraph, SchemaRole, NS, SCHEMA_GRAPH, SYSTEM_GRAPHS};
+use crate::ladybug::LadybugSchemaStore;
+use crate::registry::{self, owl, rdfs, SchemaGraph, SchemaRole, RDF_TYPE};
 use crate::validate::{self, Mode, Report, ShexResult};
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
-use oxigraph::model::{GraphName, GraphNameRef, NamedNode, Term};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Term};
 use oxigraph::store::Store;
 use rudof_rdf::rdf_core::RDFFormat;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 /// Prefixes used when saving a dataset as TriG.
-const PREFIXES: [(&str, &str); 8] = [
-    ("oxl", NS),
+const PREFIXES: [(&str, &str); 7] = [
     ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
     ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
     ("owl", "http://www.w3.org/2002/07/owl#"),
@@ -36,7 +39,7 @@ pub struct AddOptions {
     pub applies_to: Vec<GraphName>,
     /// A version to pin; by default the ontology's `owl:versionIRI` or `owl:versionInfo`.
     pub version: Option<String>,
-    /// Imports to record in the registry (`oxl:imports`), besides the `owl:imports` the
+    /// Imports to record in the registry, besides the `owl:imports` the
     /// ontology asserts itself.
     pub imports: Vec<NamedNode>,
     /// Register the graph inactive.
@@ -84,10 +87,11 @@ pub enum Drift {
     Unrecorded { actual: String },
 }
 
-/// An RDF dataset with a schema registry.
+/// An RDF dataset with a Ladybug-backed schema registry.
 #[derive(Clone)]
 pub struct Catalog {
     store: Store,
+    registry: LadybugSchemaStore,
 }
 
 /// Lowercase hex SHA-256 of a document.
@@ -114,36 +118,49 @@ pub fn format_of(path: &Path) -> Result<RdfFormat> {
         .ok_or_else(|| Error::Other(format!("cannot tell the RDF format of {}", path.display())))
 }
 
+/// The registry path for a dataset file: the same stem with an `.lbdb` extension
+/// (`dataset.trig` goes with `dataset.lbdb`).
+pub fn default_registry_path(dataset: &Path) -> PathBuf {
+    dataset.with_extension("lbdb")
+}
+
 impl Catalog {
-    /// An empty dataset, without system graphs (see [`Catalog::install_system_graphs`]).
+    /// An empty dataset with an in-memory registry.
     pub fn new() -> Result<Self> {
         Ok(Self {
             store: Store::new()?,
+            registry: LadybugSchemaStore::open_in_memory()?,
         })
     }
 
-    /// The dataset of a TriG or N-Quads file; an empty one if the file does not exist.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let c = Self::new()?;
-        if path.exists() {
-            let format = format_of(path)?;
-            c.store.load_from_reader(
+    /// Opens a dataset: RDF content from the TriG or N-Quads file at `data` (an empty
+    /// dataset if the file does not exist) and the registry from the Ladybug database at
+    /// `registry` (created when missing). See [`default_registry_path`].
+    pub fn open(data: impl AsRef<Path>, registry: impl AsRef<Path>) -> Result<Self> {
+        let data = data.as_ref();
+        let store = Store::new()?;
+        if data.exists() {
+            let format = format_of(data)?;
+            store.load_from_reader(
                 RdfParser::from_format(format),
-                std::fs::read(path)?.as_slice(),
+                std::fs::read(data)?.as_slice(),
             )?;
         }
-        Ok(c)
+        Ok(Self {
+            store,
+            registry: LadybugSchemaStore::open(registry)?,
+        })
     }
 
-    /// Saves the dataset (TriG or N-Quads, by extension), replacing the file atomically.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let format = format_of(path)?;
+    /// Saves the RDF content (TriG or N-Quads, by extension), replacing the file atomically.
+    /// The registry needs no saving: Ladybug persists it as it changes.
+    pub fn save(&self, data: impl AsRef<Path>) -> Result<()> {
+        let data = data.as_ref();
+        let format = format_of(data)?;
         if !format.supports_datasets() {
             return Err(Error::Other(format!(
                 "{} must be TriG (.trig) or N-Quads (.nq) to hold a dataset",
-                path.display()
+                data.display()
             )));
         }
         let mut serializer = RdfSerializer::from_format(format);
@@ -163,9 +180,9 @@ impl Catalog {
             writer.serialize_quad(q)?;
         }
         let bytes = writer.finish()?;
-        let tmp = path.with_extension("tmp~");
+        let tmp = data.with_extension("tmp~");
         std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)?;
+        std::fs::rename(&tmp, data)?;
         Ok(())
     }
 
@@ -174,43 +191,16 @@ impl Catalog {
         &self.store
     }
 
-    // ------------------------------------------------------------------------------- SPARQL
-
-    /// Runs a SPARQL update.
-    pub fn update(&self, sparql: &str) -> Result<()> {
-        SparqlEvaluator::new()
-            .parse_update(sparql)?
-            .on_store(&self.store)
-            .execute()?;
-        Ok(())
+    /// The Ladybug schema registry.
+    pub fn registry(&self) -> &LadybugSchemaStore {
+        &self.registry
     }
 
-    /// Runs a SPARQL query.
-    pub fn query(&self, sparql: &str) -> Result<QueryResults<'static>> {
-        Ok(SparqlEvaluator::new()
-            .parse_query(sparql)?
-            .on_store(&self.store)
-            .execute()?)
-    }
-
-    /// The rows of a SELECT, for the given variables.
-    fn rows(&self, sparql: &str, vars: &[&str]) -> Result<Vec<Vec<Option<Term>>>> {
-        let QueryResults::Solutions(solutions) = self.query(sparql)? else {
-            return Err(Error::Other("expected a SELECT".into()));
-        };
-        let mut out = Vec::new();
-        for s in solutions {
-            let s = s?;
-            out.push(vars.iter().map(|v| s.get(*v).cloned()).collect());
-        }
-        Ok(out)
-    }
-
-    fn ask(&self, sparql: &str) -> Result<bool> {
-        match self.query(sparql)? {
-            QueryResults::Boolean(b) => Ok(b),
-            _ => Err(Error::Other("expected an ASK".into())),
-        }
+    /// Runs Cypher against the schema registry (see
+    /// [`LadybugSchemaStore::cypher`]). This replaces the old SPARQL query surface: the
+    /// registry is a property graph, so it speaks Cypher.
+    pub fn cypher(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
+        self.registry.cypher(cypher)
     }
 
     // ------------------------------------------------------------------------------ loading
@@ -246,30 +236,32 @@ impl Catalog {
         String::from_utf8(bytes).map_err(|e| Error::Other(e.to_string()))
     }
 
-    /// The number of triples in a graph.
+    /// The number of triples in a graph, counted from the store directly.
     pub fn graph_len(&self, graph: GraphNameRef<'_>) -> Result<usize> {
-        let rows = self.rows(&registry::size_query(graph), &["n"])?;
-        Ok(match rows.first().and_then(|r| r[0].as_ref()) {
-            Some(Term::Literal(l)) => l.value().parse().unwrap_or(0),
-            _ => 0,
-        })
+        let target = graph.into_owned();
+        Ok(self
+            .store
+            .iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .filter(|q| q.graph_name == target)
+            .count())
     }
 
     // ----------------------------------------------------------------------------- registry
 
-    /// Installs (or refreshes) `<oxilite:schema>` and `<oxilite:vocabulary>`; does nothing when
-    /// they are already at the current vocabulary version. Returns whether it wrote anything.
-    pub fn install_system_graphs(&self) -> Result<bool> {
-        if self.ask(&registry::system_graphs_ready_query())? {
-            return Ok(false);
-        }
-        self.update(&registry::system_graphs_update())?;
-        Ok(true)
-    }
-
-    /// Registers a graph, replacing any previous description of it.
+    /// Registers a graph, replacing any previous registration of it in the same role.
+    /// `loaded_at` defaults to now when absent.
     pub fn register(&self, entry: &SchemaGraph) -> Result<()> {
-        self.update(&registry::register_update(entry)?)
+        reject_blank_graph(entry.graph.as_ref())?;
+        let mut e = entry.clone();
+        if e.loaded_at.is_none() {
+            e.loaded_at = Some(now());
+        }
+        e.applies_to.sort_by_key(|g| g.to_string());
+        e.imports.sort();
+        e.imports.dedup();
+        self.registry.upsert(&e)
     }
 
     /// Loads a schema document into `graph` (replacing its content) and registers it with
@@ -283,7 +275,7 @@ impl Catalog {
         format: RdfFormat,
         options: &AddOptions,
     ) -> Result<SchemaGraph> {
-        registry::graph_node(graph)?;
+        reject_blank_graph(graph)?;
         self.load(graph, document, format, true)?;
         let mut e = SchemaGraph::new(graph.into_owned(), role);
         e.applies_to = options.applies_to.clone();
@@ -306,65 +298,99 @@ impl Catalog {
             .unwrap_or(e))
     }
 
-    /// The `owl:Ontology` a graph declares (when exactly one), and its version.
+    /// The `owl:Ontology` a graph declares (when exactly one), and its version: the
+    /// `owl:versionIRI` when present, else the `owl:versionInfo`. Read from the store
+    /// directly, without SPARQL.
     fn ontology_header(
         &self,
         graph: GraphNameRef<'_>,
     ) -> Result<(Option<NamedNode>, Option<String>)> {
-        let q = format!(
-            "SELECT ?o ?vi ?v WHERE {{ {} {{ ?o a <{}> \
-             OPTIONAL {{ ?o <{}> ?vi }} OPTIONAL {{ ?o <{}> ?v }} }} }}",
-            graph_clause(graph),
-            vocab::OWL_ONTOLOGY,
-            vocab::OWL_VERSION_IRI,
-            vocab::OWL_VERSION_INFO,
-        );
-        let rows = self.rows(&q, &["o", "vi", "v"])?;
-        let onts: BTreeSet<String> = rows
+        let target = graph.into_owned();
+        let mut onts = BTreeSet::new();
+        let mut version_iri = None;
+        let mut version_info = None;
+        for q in self
+            .store
             .iter()
-            .filter_map(|r| match &r[0] {
-                Some(Term::NamedNode(n)) => Some(n.as_str().to_owned()),
-                _ => None,
-            })
-            .collect();
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        {
+            if q.graph_name != target {
+                continue;
+            }
+            match (q.predicate.as_str(), &q.object) {
+                (RDF_TYPE, Term::NamedNode(c)) if c.as_str() == owl::ONTOLOGY => {
+                    if let NamedOrBlankNode::NamedNode(s) = &q.subject {
+                        onts.insert(s.as_str().to_owned());
+                    }
+                }
+                (p, Term::NamedNode(v)) if p == owl::VERSION_IRI => {
+                    version_iri = Some(v.as_str().to_owned());
+                }
+                (p, Term::Literal(v)) if p == owl::VERSION_INFO => {
+                    version_info = Some(v.value().to_owned());
+                }
+                _ => {}
+            }
+        }
         if onts.len() != 1 {
             return Ok((None, None));
         }
         let iri = NamedNode::new(onts.into_iter().next().expect("one"))?;
-        let version = rows.iter().find_map(|r| match (&r[1], &r[2]) {
-            (Some(Term::NamedNode(n)), _) => Some(n.as_str().to_owned()),
-            (_, Some(Term::Literal(l))) => Some(l.value().to_owned()),
-            _ => None,
-        });
-        Ok((Some(iri), version))
+        Ok((Some(iri), version_iri.or(version_info)))
+    }
+
+    /// The registrations of `graph`, in every role.
+    fn entries_of(&self, graph: GraphNameRef<'_>) -> Result<Vec<SchemaGraph>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|e| e.graph.as_ref() == graph)
+            .collect())
     }
 
     /// Sets the graphs a registration applies to (empty: every graph), keeping the rest.
+    /// Every role of the graph shares the new targets.
     pub fn map(&self, graph: GraphNameRef<'_>, applies_to: &[GraphName]) -> Result<()> {
-        self.require(graph)?;
-        self.update(&registry::remap_update(graph, applies_to)?)
+        let mut entries = self.entries_of(graph)?;
+        if entries.is_empty() {
+            return Err(Error::NotRegistered(graph.to_string()));
+        }
+        for e in &mut entries {
+            e.applies_to = applies_to.to_vec();
+            self.registry.upsert(e)?;
+        }
+        Ok(())
     }
 
-    /// Activates or deactivates a registration.
+    /// Activates or deactivates a registration, in every role of the graph.
     pub fn set_active(&self, graph: GraphNameRef<'_>, active: bool) -> Result<()> {
-        self.require(graph)?;
-        self.update(&registry::set_active_update(graph, active)?)
+        let mut entries = self.entries_of(graph)?;
+        if entries.is_empty() {
+            return Err(Error::NotRegistered(graph.to_string()));
+        }
+        for e in &mut entries {
+            e.active = active;
+            self.registry.upsert(e)?;
+        }
+        Ok(())
     }
 
     /// Removes a registration; the graph's triples stay.
     pub fn unregister(&self, graph: GraphNameRef<'_>) -> Result<()> {
         self.require(graph)?;
-        self.update(&registry::unregister_update(graph)?)
+        self.registry.remove_graph(&graph.into_owned())
     }
 
     /// Removes a registration and every triple of its graph.
     pub fn drop_graph(&self, graph: GraphNameRef<'_>) -> Result<()> {
-        self.update(&registry::drop_update(graph)?)
+        self.registry.remove_graph(&graph.into_owned())?;
+        self.store.clear_graph(graph)?;
+        Ok(())
     }
 
     /// Is the graph registered (in any role)?
     pub fn is_registered(&self, graph: GraphNameRef<'_>) -> Result<bool> {
-        self.ask(&registry::registered_query(graph)?)
+        Ok(!self.entries_of(graph)?.is_empty())
     }
 
     fn require(&self, graph: GraphNameRef<'_>) -> Result<()> {
@@ -375,30 +401,15 @@ impl Catalog {
         }
     }
 
-    fn registry_rows(&self) -> Result<Vec<Vec<Option<Term>>>> {
-        self.rows(&registry::entries_query(), &["g", "p", "o"])
-    }
-
     /// Every registration, once per role, ordered by role and graph.
     pub fn list(&self) -> Result<Vec<SchemaGraph>> {
-        Ok(registry::entries_from_rows(&self.registry_rows()?))
+        self.registry.load_entries()
     }
 
-    /// What is wrong with the registry: the violations of `oxl:RegistrationShape`, found
-    /// without a SHACL engine. Empty means valid.
+    /// What is wrong with the registry: structural violations over the Ladybug entries.
+    /// Empty means valid.
     pub fn problems(&self) -> Result<Vec<String>> {
-        Ok(registry::problems(&self.registry_rows()?))
-    }
-
-    /// Validates the registry graph against `oxl:RegistrationShape` with a SHACL engine.
-    pub fn check_registry(&self) -> Result<Report> {
-        let data = self.graph_ntriples(named(SCHEMA_GRAPH).as_ref())?;
-        validate::shacl(
-            &data,
-            registry::VOCABULARY,
-            &RDFFormat::Turtle,
-            &Mode::Native,
-        )
+        Ok(registry::problems(&self.list()?))
     }
 
     /// Compares a registered graph's recorded SHA-256 with a document.
@@ -418,26 +429,29 @@ impl Catalog {
 
     // ------------------------------------------------------------------------------ scoping
 
-    /// The `owl:imports` an ontology graph asserts about itself (or anything in it).
+    /// The `owl:imports` an ontology graph asserts about itself, read from the store
+    /// directly, without SPARQL.
     fn asserted_imports(&self, graph: GraphNameRef<'_>) -> Result<Vec<String>> {
-        let q = format!(
-            "SELECT DISTINCT ?i WHERE {{ {} {{ ?o <{}> ?i }} }}",
-            graph_clause(graph),
-            vocab::OWL_IMPORTS
-        );
-        Ok(self
-            .rows(&q, &["i"])?
-            .into_iter()
-            .filter_map(|r| match &r[0] {
-                Some(Term::NamedNode(n)) => Some(n.as_str().to_owned()),
-                _ => None,
-            })
-            .collect())
+        let target = graph.into_owned();
+        let mut out = BTreeSet::new();
+        for q in self
+            .store
+            .iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        {
+            if q.graph_name != target || q.predicate.as_str() != owl::IMPORTS {
+                continue;
+            }
+            if let Term::NamedNode(n) = &q.object {
+                out.insert(n.as_str().to_owned());
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// The active schemas of `role` that apply to `target`. For ontologies, the active
     /// registered ontologies they import (recorded in the registry or asserted in their own
-    /// graph, matched by graph name or `oxl:ontologyIri`) are added, transitively.
+    /// graph, matched by graph name or ontology IRI) are added, transitively.
     pub fn schemas_for(
         &self,
         target: GraphNameRef<'_>,
@@ -446,7 +460,7 @@ impl Catalog {
         let active: Vec<SchemaGraph> = self
             .list()?
             .into_iter()
-            .filter(|e| e.role == role && e.active && !is_system(&e.graph))
+            .filter(|e| e.role == role && e.active)
             .collect();
         let mut chosen: Vec<SchemaGraph> = active
             .iter()
@@ -537,56 +551,93 @@ impl Catalog {
     }
 }
 
+/// A graph named by a blank node cannot be registered: no other graph can name it.
+fn reject_blank_graph(graph: GraphNameRef<'_>) -> Result<()> {
+    match graph {
+        GraphNameRef::BlankNode(_) => Err(Error::Other(
+            "a graph named by a blank node cannot be registered as schema".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The `xsd:dateTime` of now, where a clock is available.
+fn now() -> String {
+    oxsdatatypes::DateTime::now().to_string()
+}
+
 /// The `rdf:type` triples entailed through `rdfs:subClassOf` and `owl:equivalentClass`, as
 /// N-Triples. SHACL's `sh:targetClass` and `sh:class` follow `rdfs:subClassOf` in the data
 /// graph; writing the closure out makes every engine agree, whatever its class index does.
+/// Computed by graph traversal, without SPARQL.
 fn type_closure(ntriples: &str) -> Result<String> {
-    let store = Store::new()?;
-    store.load_from_reader(RdfFormat::NTriples, ntriples.as_bytes())?;
-    let q = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
-             PREFIX owl: <http://www.w3.org/2002/07/owl#> \
-             CONSTRUCT { ?x a ?super } WHERE { \
-               ?x a ?c . \
-               ?c (rdfs:subClassOf|owl:equivalentClass|^owl:equivalentClass)+ ?super . \
-               FILTER (isIRI(?super)) }";
-    let QueryResults::Graph(triples) = SparqlEvaluator::new()
-        .parse_query(q)?
-        .on_store(&store)
-        .execute()?
-    else {
-        unreachable!("a CONSTRUCT returns triples");
-    };
+    use oxrdfio::RdfParser;
+    let triples: Vec<oxrdf::Triple> = RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
+        .for_slice(ntriples.as_bytes())
+        .map(|q| {
+            q.map(|q| oxrdf::Triple {
+                subject: q.subject,
+                predicate: q.predicate,
+                object: q.object,
+            })
+        })
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::Other(format!("data graph: {e}")))?;
+    // Child class -> parent classes, through subClassOf and equivalentClass (both ways).
+    let mut parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for t in &triples {
+        let (child, parent) = match (t.predicate.as_str(), &t.subject, &t.object) {
+            (p, NamedOrBlankNode::NamedNode(c), Term::NamedNode(pa)) if p == rdfs::SUB_CLASS_OF => {
+                (c.as_str(), pa.as_str())
+            }
+            (p, NamedOrBlankNode::NamedNode(a), Term::NamedNode(b))
+                if p == owl::EQUIVALENT_CLASS =>
+            {
+                parents
+                    .entry(a.as_str().to_owned())
+                    .or_default()
+                    .insert(b.as_str().to_owned());
+                (b.as_str(), a.as_str())
+            }
+            _ => continue,
+        };
+        parents
+            .entry(child.to_owned())
+            .or_default()
+            .insert(parent.to_owned());
+    }
     let mut out = String::new();
-    for t in triples {
-        out.push_str(&format!("{} .\n", t?));
+    for t in &triples {
+        let (subject, class) = match (&t.subject, &t.object) {
+            (s, Term::NamedNode(c)) if t.predicate.as_str() == RDF_TYPE => (s, c.as_str()),
+            _ => continue,
+        };
+        // Transitive parents of the asserted class (the class itself is already stated).
+        let mut seen = BTreeSet::from([class.to_owned()]);
+        let mut todo: Vec<String> = parents
+            .get(class)
+            .map(|ps| ps.iter().cloned().collect())
+            .unwrap_or_default();
+        while let Some(p) = todo.pop() {
+            if !seen.insert(p.clone()) {
+                continue;
+            }
+            out.push_str(&format!(
+                "{subject} <{RDF_TYPE}> <{p}> .\n",
+                subject = subject
+            ));
+            if let Some(next) = parents.get(&p) {
+                todo.extend(next.iter().cloned());
+            }
+        }
     }
     Ok(out)
 }
 
-fn named(iri: &str) -> GraphName {
-    NamedNode::new_unchecked(iri).into()
-}
-
-fn is_system(g: &GraphName) -> bool {
-    matches!(g, GraphName::NamedNode(n) if SYSTEM_GRAPHS.contains(&n.as_str()))
-}
-
-/// `GRAPH <g>` for a named graph, nothing for the default graph (the default graph of an
-/// Oxigraph query is the store's default graph).
-fn graph_clause(g: GraphNameRef<'_>) -> String {
-    match g {
-        GraphNameRef::NamedNode(n) => format!("GRAPH {n}"),
-        _ => String::new(),
-    }
-}
-
 /// Parses a graph argument: an IRI, `<IRI>`, or `DEFAULT` for the default graph.
 pub fn parse_graph(s: &str) -> Result<GraphName> {
-    if s.eq_ignore_ascii_case("default") {
-        return Ok(GraphName::DefaultGraph);
-    }
     let s = s.trim_start_matches('<').trim_end_matches('>');
-    if s == vocab::DEFAULT_GRAPH {
+    if s.eq_ignore_ascii_case("default") {
         return Ok(GraphName::DefaultGraph);
     }
     Ok(NamedNode::new(s)?.into())
@@ -594,10 +645,7 @@ pub fn parse_graph(s: &str) -> Result<GraphName> {
 
 /// Parses `applies-to` targets: `ALL` (or none) is every graph.
 pub fn parse_targets<S: AsRef<str>>(items: &[S]) -> Result<Vec<GraphName>> {
-    if items.iter().any(|s| {
-        s.as_ref().eq_ignore_ascii_case("all")
-            || s.as_ref().trim_matches(['<', '>']) == vocab::ALL_GRAPHS
-    }) {
+    if items.iter().any(|s| s.as_ref().eq_ignore_ascii_case("all")) {
         return Ok(Vec::new());
     }
     items.iter().map(|s| parse_graph(s.as_ref())).collect()

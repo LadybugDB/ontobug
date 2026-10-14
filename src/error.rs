@@ -13,12 +13,6 @@ pub enum Error {
     Serialize(#[from] oxigraph::store::SerializerError),
     #[error("storage: {0}")]
     Storage(#[from] oxigraph::store::StorageError),
-    #[error("SPARQL query: {0}")]
-    Query(#[from] oxigraph::sparql::QueryEvaluationError),
-    #[error("SPARQL update: {0}")]
-    Update(#[from] oxigraph::sparql::UpdateEvaluationError),
-    #[error("SPARQL syntax: {0}")]
-    Syntax(#[from] oxigraph::sparql::SparqlSyntaxError),
     #[error("invalid shapes: {0}")]
     Shapes(String),
     #[error("validation failed: {0}")]
@@ -27,6 +21,10 @@ pub enum Error {
     NotRegistered(String),
     #[error("no active {role} graph applies to {graph}; register one or name it explicitly")]
     NoSchema { role: &'static str, graph: String },
+    #[error("ladybug: {0}")]
+    Ladybug(String),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

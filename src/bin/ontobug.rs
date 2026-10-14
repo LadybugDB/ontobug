@@ -1,11 +1,13 @@
-//! `ontolith`: manage the ontologies, shapes and data graphs of a dataset file, and validate.
+//! `ontobug`: manage the ontologies, shapes and data graphs of a dataset, and validate.
+//!
+//! RDF content lives in a TriG/N-Quads file; the schema registry lives in a Ladybug
+//! database and speaks Cypher.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use ontolith::oxigraph::model::{GraphName, NamedNode};
-use ontolith::oxigraph::sparql::QueryResults;
-use ontolith::{
-    format_of, parse_graph, parse_targets, AddOptions, Catalog, Drift, Mode, SchemaGraph,
-    SchemaRole, ValidateOptions, Validation,
+use ontobug::oxigraph::model::{GraphName, NamedNode};
+use ontobug::{
+    default_registry_path, format_of, parse_graph, parse_targets, AddOptions, Catalog, Drift,
+    SchemaGraph, SchemaRole, ValidateOptions, Validation,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -13,14 +15,18 @@ use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(
-    name = "ontolith",
+    name = "ontobug",
     version,
     about = "Vocabulary and ontology management for RDF datasets"
 )]
 struct Cli {
     /// The dataset file (TriG `.trig` or N-Quads `.nq`). Created when missing.
-    #[arg(short, long, env = "ONTOLITH_DATASET", default_value = "dataset.trig")]
+    #[arg(short, long, env = "ONTOBUG_DATASET", default_value = "dataset.trig")]
     dataset: PathBuf,
+    /// The Ladybug registry database (`.lbdb`). Defaults to the dataset stem, e.g.
+    /// `dataset.lbdb` next to `dataset.trig`.
+    #[arg(short, long, env = "ONTOBUG_LADYBUG")]
+    ladybug: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -50,8 +56,6 @@ enum Output {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install the registry and vocabulary system graphs.
-    Init,
     /// Load a schema document into a graph and register it.
     Add {
         role: Role,
@@ -106,7 +110,7 @@ enum Command {
         #[arg(long)]
         drop: bool,
     },
-    /// Check the registry against its own shapes.
+    /// Check the registry for structural problems.
     Check,
     /// Compare a registered graph's recorded SHA-256 with a file.
     Verify {
@@ -123,9 +127,6 @@ enum Command {
         /// Do not add the ontologies in scope to the data graph.
         #[arg(long)]
         no_ontologies: bool,
-        /// Use rudof's SPARQL engine instead of the native one.
-        #[arg(long)]
-        sparql: bool,
         #[arg(long, value_enum, default_value_t = Output::Text)]
         output: Output,
     },
@@ -142,10 +143,8 @@ enum Command {
         #[arg(long, default_value = "http://example.org/")]
         base: String,
     },
-    /// Run a SPARQL query (SELECT/ASK print as TSV; CONSTRUCT/DESCRIBE as N-Triples).
-    Query { sparql: String },
-    /// Run a SPARQL update.
-    Update { sparql: String },
+    /// Run Cypher against the schema registry, printing rows as TSV.
+    Cypher { cypher: String },
     /// Print the dataset as TriG, or one graph as N-Triples.
     Export { graph: Option<String> },
 }
@@ -236,23 +235,14 @@ fn validation_json(v: &Validation) -> Value {
     })
 }
 
-fn run(cli: Cli) -> ontolith::Result<ExitCode> {
-    let c = Catalog::open(&cli.dataset)?;
+fn run(cli: Cli) -> ontobug::Result<ExitCode> {
+    let registry = cli
+        .ladybug
+        .clone()
+        .unwrap_or_else(|| default_registry_path(&cli.dataset));
+    let c = Catalog::open(&cli.dataset, &registry)?;
     let save = |c: &Catalog| c.save(&cli.dataset);
     match cli.command {
-        Command::Init => {
-            let wrote = c.install_system_graphs()?;
-            save(&c)?;
-            println!(
-                "{} {}",
-                if wrote {
-                    "installed system graphs in"
-                } else {
-                    "system graphs already current in"
-                },
-                cli.dataset.display()
-            );
-        }
         Command::Add {
             role,
             graph,
@@ -262,7 +252,6 @@ fn run(cli: Cli) -> ontolith::Result<ExitCode> {
             imports,
             inactive,
         } => {
-            c.install_system_graphs()?;
             let g = parse_graph(&graph)?;
             let options = AddOptions {
                 applies_to: parse_targets(&applies_to)?,
@@ -348,14 +337,10 @@ fn run(cli: Cli) -> ontolith::Result<ExitCode> {
         }
         Command::Check => {
             let problems = c.problems()?;
-            let report = c.check_registry()?;
             for p in &problems {
                 println!("{p}");
             }
-            if !report.conforms {
-                print!("{report}");
-            }
-            if !problems.is_empty() || !report.conforms {
+            if !problems.is_empty() {
                 return Ok(ExitCode::from(1));
             }
             println!("registry ok ({} registrations)", c.list()?.len());
@@ -378,7 +363,6 @@ fn run(cli: Cli) -> ontolith::Result<ExitCode> {
             graph,
             shapes,
             no_ontologies,
-            sparql,
             output,
         } => {
             let g = parse_graph(&graph)?;
@@ -388,7 +372,7 @@ fn run(cli: Cli) -> ontolith::Result<ExitCode> {
                     .map(|s| parse_graph(s))
                     .collect::<Result<_, _>>()?,
                 with_ontologies: !no_ontologies,
-                mode: if sparql { Mode::Sparql } else { Mode::Native },
+                ..Default::default()
             };
             let v = c.validate(g.as_ref(), &options)?;
             if output == Output::Json {
@@ -428,45 +412,16 @@ fn run(cli: Cli) -> ontolith::Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         }
-        Command::Query { sparql } => match c.query(&sparql)? {
-            QueryResults::Boolean(b) => println!("{b}"),
-            QueryResults::Solutions(s) => {
-                let vars: Vec<String> = s
-                    .variables()
-                    .iter()
-                    .map(|v| v.as_str().to_owned())
-                    .collect();
-                let head: Vec<String> = vars.iter().map(|v| format!("?{v}")).collect();
-                println!("{}", head.join("\t"));
-                for row in s {
-                    let row = row.map_err(ontolith::Error::from)?;
-                    let cells: Vec<String> = vars
-                        .iter()
-                        .map(|v| {
-                            row.get(v.as_str())
-                                .map(ToString::to_string)
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    println!("{}", cells.join("\t"));
-                }
+        Command::Cypher { cypher } => {
+            for row in c.cypher(&cypher)? {
+                println!("{}", row.join("\t"));
             }
-            QueryResults::Graph(triples) => {
-                for t in triples {
-                    println!("{} .", t.map_err(ontolith::Error::from)?);
-                }
-            }
-        },
-        Command::Update { sparql } => {
-            c.update(&sparql)?;
-            save(&c)?;
-            println!("updated");
         }
         Command::Export { graph } => match graph {
             Some(g) => print!("{}", c.graph_ntriples(parse_graph(&g)?.as_ref())?),
             None => {
                 let tmp =
-                    std::env::temp_dir().join(format!("ontolith-{}.trig", std::process::id()));
+                    std::env::temp_dir().join(format!("ontobug-{}.trig", std::process::id()));
                 c.save(&tmp)?;
                 print!("{}", std::fs::read_to_string(&tmp)?);
                 std::fs::remove_file(&tmp)?;

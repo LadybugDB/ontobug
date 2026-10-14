@@ -1,5 +1,5 @@
 [package]
-name = "ontolith"
+name = "ontobug"
 description = "Vocabulary and ontology management for RDF datasets: register OWL ontologies, SHACL shapes and ShEx schemas as named graphs, map them to data graphs, and validate"
 version = "0.1.0"
 edition = "2021"
@@ -12,14 +12,13 @@ readme = "README.md"
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:serde_json"]
+cli = ["dep:clap"]
 
 [dependencies]
 oxigraph = { version = "0.5.11", default-features = false }
 oxrdf = "0.3.4"
 oxrdfio = "0.2.6"
 oxsdatatypes = "0.2.3"
-spargebra = "0.4.7"
 sha2 = "0.10"
 thiserror = "2"
 rudof_rdf = "0.3.21"
@@ -28,8 +27,12 @@ shacl = "0.3.21"
 shex_ast = "0.3.21"
 shex_validation = "0.3.21"
 clap = { version = "4", features = ["derive", "env"], optional = true }
-serde_json = { version = "1", optional = true }
+lbug = "0.21"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
-name = "ontolith"
+name = "ontobug"
 required-features = ["cli"]
